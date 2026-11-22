@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"html"
+	"strings"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -40,23 +41,12 @@ type User struct {
 	CreatedAt    string // 账号创建时间
 }
 
-func GetUserById(ctx context.Context, client *resty.Client, id uint64) (*User, uint64, error) {
-	api := userByRestId{id}
-	getUrl := makeUrl(&api)
-	r, uid, err := getUser(ctx, client, getUrl)
-	if err != nil {
-		// 返回 uid（可能是从 UserUnavailable 中提取的ID）用于标记不可访问状态
-		return nil, uid, fmt.Errorf("failed to get user [%d]: %v", id, err)
-	}
-	return r, uid, err
-}
-
 func GetUserByScreenName(ctx context.Context, master *resty.Client, additional []*resty.Client, screenName string) (*User, uint64, error) {
 	cli := SelectClientMFQ(ctx, master, additional, nil, (&userByScreenName{}).Path())
 	if cli == nil {
 		return nil, 0, fmt.Errorf("failed to get user [%s]: no available client", screenName)
 	}
-	log.Debugf("[twitter] GetUserByScreenName(%s) → client: %s", screenName, GetClientScreenName(cli))
+	log.Debugf("[twitter] User lookup screen_name=@%s account=%s", strings.TrimPrefix(screenName, "@"), clientNameForLog(cli))
 	u := makeUrl(&userByScreenName{screenName: screenName})
 	r, uid, err := getUser(ctx, cli, u)
 	if err != nil {
@@ -90,11 +80,11 @@ func parseUserResults(user_results *gjson.Result) (*User, uint64, error) {
 	if result.Get("__typename").String() == "UserUnavailable" {
 		// 返回不可访问用户的 ID，用于标记状态
 		if restId := result.Get("rest_id"); restId.Exists() {
-			log.Debugf("[twitter] UserUnavailable detected, rest_id: %s", restId.String())
+			log.Debugf("[twitter] User unavailable rest_id=%s", restId.String())
 			return nil, restId.Uint(), fmt.Errorf("user unavaiable")
 		}
 		// 尝试从其他字段获取ID
-		log.Debugf("[twitter] UserUnavailable result: %s", result.String())
+		log.Debugf("[twitter] User unavailable rest_id=unknown")
 		return nil, 0, fmt.Errorf("user unavaiable")
 	}
 	legacy := result.Get("legacy")
@@ -172,12 +162,12 @@ func itemContentsToTweets(itemContents []gjson.Result) []*Tweet {
 	for _, itemContent := range itemContents {
 		tweetResults, err := getResults(itemContent, timelineTweet)
 		if err != nil {
-			log.Debugln("[twitter] GetResults failed:", err)
+			log.Debugf("[twitter] Timeline tweet result parse failed error=%q", errorForLog(err))
 			continue
 		}
 		tw, err := parseTweetResults(&tweetResults)
 		if err != nil {
-			log.Debugln("[twitter] ParseTweetResults failed:", err)
+			log.Debugf("[twitter] Tweet parse failed error=%q", errorForLog(err))
 			continue
 		}
 		if tw != nil {
@@ -252,9 +242,12 @@ func (u *User) GetMedias(ctx context.Context, client *resty.Client, timeRange *u
 		maxTime = &timeRange.Max
 	}
 
+	log.Debugf("[twitter] UserMedia start user=%s account=%s timerange=%t", u.ScreenName, clientNameForLog(client), timeRange != nil)
+
 	for {
 		currentTweets, next, err := u.getMediasOnePage(ctx, &api, client)
 		if err != nil {
+			log.Debugf("[twitter] UserMedia page failed user=%s account=%s error=%q", u.ScreenName, clientNameForLog(client), errorForLog(err))
 			return nil, err
 		}
 

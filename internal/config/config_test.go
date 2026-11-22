@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"testing"
 
@@ -17,6 +18,45 @@ func clearConfigEnv(t *testing.T) {
 	for _, field := range GetFieldDefs() {
 		t.Setenv(field.EnvName, "")
 	}
+}
+
+func TestWriteDefaultBotConfig(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "bot_config.yaml")
+	require.NoError(t, os.WriteFile(configPath, []byte("partial"), 0644))
+
+	require.NoError(t, WriteDefaultBotConfig(configPath))
+	written, err := os.ReadFile(configPath)
+	require.NoError(t, err)
+	assert.Equal(t, defaultBotConfig, written)
+	assert.Contains(t, string(written), "# --- Telegram ---")
+	assert.Contains(t, string(written), "# --- Feishu / Lark ---")
+	if runtime.GOOS != "windows" {
+		info, statErr := os.Stat(configPath)
+		require.NoError(t, statErr)
+		assert.Equal(t, os.FileMode(0600), info.Mode().Perm())
+	}
+	tempFiles, err := filepath.Glob(configPath + ".tmp-*")
+	require.NoError(t, err)
+	assert.Empty(t, tempFiles)
+}
+
+func TestFieldDefsOrderPlacesUserFetchNextToDownloadRoutine(t *testing.T) {
+	fields := GetFieldDefs()
+	downloadIdx := -1
+	userFetchIdx := -1
+	for i, f := range fields {
+		switch f.Name {
+		case "max_download_routine":
+			downloadIdx = i
+		case "max_user_fetch_concurrent":
+			userFetchIdx = i
+		}
+	}
+
+	assert.GreaterOrEqual(t, downloadIdx, 0, "max_download_routine should exist")
+	assert.GreaterOrEqual(t, userFetchIdx, 0, "max_user_fetch_concurrent should exist")
+	assert.Equal(t, downloadIdx+1, userFetchIdx,
+		"max_user_fetch_concurrent should appear immediately after max_download_routine in Web field order")
 }
 
 func TestMaxDownloadRoutineFieldUsesConfigDefault(t *testing.T) {
@@ -37,6 +77,26 @@ func TestMaxDownloadRoutineFieldUsesConfigDefault(t *testing.T) {
 	}
 
 	t.Fatal("max_download_routine field not found")
+}
+
+func TestMaxUserFetchConcurrentFieldUsesConfigDefault(t *testing.T) {
+	want := strconv.Itoa(DefaultMaxUserFetchConcurrent())
+
+	for _, field := range GetFieldDefs() {
+		if field.Name != "max_user_fetch_concurrent" {
+			continue
+		}
+
+		assert.Equal(t, want, field.Default)
+		assert.Equal(t, want, field.Getter(&Config{}))
+
+		conf := &Config{}
+		assert.NoError(t, field.Setter(conf, ""))
+		assert.Equal(t, DefaultMaxUserFetchConcurrent(), conf.MaxUserFetchConcurrent)
+		return
+	}
+
+	t.Fatal("max_user_fetch_concurrent field not found")
 }
 
 func TestMaxFileNameLenFieldUsesUtilsDefault(t *testing.T) {
@@ -75,17 +135,35 @@ func TestProxyURLFieldNormalizesAndValidates(t *testing.T) {
 		assert.NoError(t, field.Setter(conf, "socks5://127.0.0.1:7890"))
 		assert.Equal(t, "socks5://127.0.0.1:7890", conf.ProxyURL)
 
+		assert.NoError(t, field.Setter(conf, "socks5h://127.0.0.1:7890"))
+		assert.Equal(t, "socks5h://127.0.0.1:7890", conf.ProxyURL)
+
 		err := field.Setter(conf, "127.0.0.1:7897")
 		assert.EqualError(t, err, `invalid proxy URL "127.0.0.1:7897": missing scheme or host`)
-		assert.Equal(t, "socks5://127.0.0.1:7890", conf.ProxyURL)
+		assert.Equal(t, "socks5h://127.0.0.1:7890", conf.ProxyURL)
 
 		err = field.Setter(conf, "ftp://127.0.0.1:21")
 		assert.EqualError(t, err, `invalid proxy URL "ftp://127.0.0.1:21": unsupported scheme "ftp"`)
-		assert.Equal(t, "socks5://127.0.0.1:7890", conf.ProxyURL)
+		assert.Equal(t, "socks5h://127.0.0.1:7890", conf.ProxyURL)
 		return
 	}
 
 	t.Fatal("proxy_url field not found")
+}
+
+func TestNormalizeProxyURLDoesNotExposeCredentialsInErrors(t *testing.T) {
+	for _, raw := range []string{
+		"ftp://proxy-user:proxy-password@example.invalid:21",
+		"http://proxy-user:proxy-password@%zz",
+		"proxy-user:proxy-password@example.invalid:7897",
+	} {
+		_, err := normalizeProxyURL(raw)
+
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "proxy-user")
+		assert.NotContains(t, err.Error(), "proxy-password")
+		assert.Contains(t, err.Error(), "redacted")
+	}
 }
 
 func TestApplyEnvOverridesConfig(t *testing.T) {
@@ -97,14 +175,16 @@ func TestApplyEnvOverridesConfig(t *testing.T) {
 	t.Setenv("TMD_CT0", "env-ct0")
 	t.Setenv("TMD_PROXY_URL", "  http://127.0.0.1:7897  ")
 	t.Setenv("TMD_MAX_DOWNLOAD_ROUTINE", "8")
+	t.Setenv("TMD_MAX_USER_FETCH_CONCURRENT", "7")
 	t.Setenv("TMD_MAX_FILE_NAME_LEN", "999")
 
 	conf := &Config{
-		RootPath:           "old-root",
-		Cookie:             Cookie{AuthToken: "old-auth", Ct0: "old-ct0"},
-		MaxDownloadRoutine: 1,
-		MaxFileNameLen:     50,
-		ProxyURL:           "socks5://127.0.0.1:7890",
+		RootPath:               "old-root",
+		Cookie:                 Cookie{AuthToken: "old-auth", Ct0: "old-ct0"},
+		MaxDownloadRoutine:     1,
+		MaxUserFetchConcurrent: 2,
+		MaxFileNameLen:         50,
+		ProxyURL:               "socks5://127.0.0.1:7890",
 	}
 
 	applied, err := ApplyEnv(conf)
@@ -118,6 +198,7 @@ func TestApplyEnvOverridesConfig(t *testing.T) {
 	assert.Equal(t, "env-ct0", conf.Cookie.Ct0)
 	assert.Equal(t, "http://127.0.0.1:7897", conf.ProxyURL)
 	assert.Equal(t, 8, conf.MaxDownloadRoutine)
+	assert.Equal(t, 7, conf.MaxUserFetchConcurrent)
 	assert.Equal(t, MaxFileNameLen, conf.MaxFileNameLen)
 }
 

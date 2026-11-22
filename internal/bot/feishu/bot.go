@@ -10,6 +10,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/unkmonster/tmd/internal/api"
+	"github.com/unkmonster/tmd/internal/bot"
 	"github.com/unkmonster/tmd/internal/config"
 	"github.com/unkmonster/tmd/internal/consolelog"
 )
@@ -20,28 +21,29 @@ type Bot struct {
 	taskManager *api.TaskManager
 	eventBus    *api.EventBus
 	logHub      *consolelog.Hub
+	enqueueTask func(*api.Task) error
 
 	cli *lark.Lark
 
 	userChats map[string]string
-	userTasks map[string]map[string]struct{}
+	tracker   *bot.TaskTracker
 	mu        sync.Mutex
 
-	callbackHandler http.HandlerFunc
-
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	stopCh   chan struct{}
+	wg       sync.WaitGroup
+	stopOnce sync.Once
 }
 
 // NewBot 创建飞书 bot 实例
-func NewBot(cfg *config.FeishuBotConfig, tm *api.TaskManager, eb *api.EventBus, lh *consolelog.Hub) *Bot {
+func NewBot(cfg *config.FeishuBotConfig, tm *api.TaskManager, eb *api.EventBus, lh *consolelog.Hub, enqueueTask func(*api.Task) error) *Bot {
 	return &Bot{
 		config:      cfg,
 		taskManager: tm,
 		eventBus:    eb,
 		logHub:      lh,
+		enqueueTask: enqueueTask,
 		userChats:   make(map[string]string),
-		userTasks:   make(map[string]map[string]struct{}),
+		tracker:     bot.NewTaskTracker(),
 		stopCh:      make(chan struct{}),
 	}
 }
@@ -57,16 +59,14 @@ func (b *Bot) Start() error {
 	}
 
 	cli := lark.New(opts...)
+	b.mu.Lock()
 	b.cli = cli
+	b.mu.Unlock()
 
 	cli.EventCallback.HandlerEventV2IMMessageReceiveV1(func(ctx context.Context, cli *lark.Lark, schema string, header *lark.EventHeaderV2, event *lark.EventV2IMMessageReceiveV1) (string, error) {
 		b.handleMessage(ctx, event)
 		return "", nil
 	})
-
-	b.callbackHandler = func(w http.ResponseWriter, r *http.Request) {
-		cli.EventCallback.ListenCallback(r.Context(), r.Body, w)
-	}
 
 	api.RunBotEventLoop(b.eventBus, b.stopCh, &b.wg, func(evt api.SSEEvent) {
 		b.notifyTaskChanges(evt.Data)
@@ -75,12 +75,14 @@ func (b *Bot) Start() error {
 		api.RunBotLogLoop(b.logHub, b.stopCh, &b.wg, b.sendLogAlert)
 	}
 
-	log.Infof("[bot-feishu] Started (app_id: %s)", b.config.AppID)
+	log.Infof("[bot-feishu] Started app_id=%s callback_path=%s", b.config.AppID, b.CallbackPath())
 	return nil
 }
 func (b *Bot) Stop() {
-	close(b.stopCh)
-	b.wg.Wait()
+	b.stopOnce.Do(func() {
+		close(b.stopCh)
+		b.wg.Wait()
+	})
 }
 
 // Name 返回 bot 名称
@@ -88,7 +90,16 @@ func (b *Bot) Name() string { return "feishu" }
 
 // CallbackHandler 返回 HTTP handler 供 Server 注册飞书事件回调路由
 func (b *Bot) CallbackHandler() http.HandlerFunc {
-	return b.callbackHandler
+	return func(w http.ResponseWriter, r *http.Request) {
+		b.mu.Lock()
+		cli := b.cli
+		b.mu.Unlock()
+		if cli == nil {
+			http.Error(w, "feishu bot not started", http.StatusServiceUnavailable)
+			return
+		}
+		cli.EventCallback.ListenCallback(r.Context(), r.Body, w)
+	}
 }
 
 // CallbackPath 返回回调路径
@@ -115,7 +126,7 @@ func (b *Bot) sendText(chatID, text string) {
 	ctx := context.Background()
 	_, _, err := b.cli.Message.Send().ToChatID(chatID).SendText(ctx, text)
 	if err != nil {
-		log.Warnf("[bot-feishu] Failed to send message: %v", err)
+		log.Warnf("[bot-feishu] Send message failed chat_id=%s error=%q", chatID, err.Error())
 	}
 }
 
@@ -123,6 +134,6 @@ func (b *Bot) sendReply(msgID, text string) {
 	ctx := context.Background()
 	_, _, err := b.cli.Message.Reply(msgID).SendText(ctx, text)
 	if err != nil {
-		log.Warnf("[bot-feishu] Failed to reply: %v", err)
+		log.Warnf("[bot-feishu] Reply failed message_id=%s error=%q", msgID, err.Error())
 	}
 }

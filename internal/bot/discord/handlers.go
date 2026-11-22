@@ -2,6 +2,8 @@ package discord
 
 import (
 	"github.com/bwmarrin/discordgo"
+
+	"github.com/unkmonster/tmd/internal/bot"
 )
 
 // registerCommands 注册全局 slash commands
@@ -53,7 +55,7 @@ func (b *Bot) registerCommands() error {
 					Required:    false,
 				},
 			},
-	},
+		},
 		{
 			Name:        "status",
 			Description: "Check task status",
@@ -83,18 +85,17 @@ func (b *Bot) registerCommands() error {
 			Description: "List recent tasks",
 		},
 		{
+			Name:        "stats",
+			Description: "Show task statistics",
+		},
+		{
 			Name:        "help",
 			Description: "Show available commands",
 		},
 	}
 
-	for _, cmd := range commands {
-		_, err := b.session.ApplicationCommandCreate(b.session.State.User.ID, "", cmd)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	_, err := b.session.ApplicationCommandBulkOverwrite(b.session.State.User.ID, "", commands)
+	return err
 }
 
 // handleInteraction 处理 slash command 交互
@@ -108,7 +109,7 @@ func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
-				Content: "⛔ Unauthorized",
+				Content: bot.UnauthorizedText,
 				Flags:   discordgo.MessageFlagsEphemeral,
 			},
 		})
@@ -124,6 +125,8 @@ func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 		b.cmdCancel(s, i, data)
 	case "tasks":
 		b.cmdTasks(s, i)
+	case "stats":
+		b.cmdStats(s, i)
 	case "help":
 		b.cmdHelp(s, i)
 	}

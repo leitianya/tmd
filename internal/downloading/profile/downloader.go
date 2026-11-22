@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	pathpkg "path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -19,6 +18,9 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/unkmonster/tmd/internal/database"
 	"github.com/unkmonster/tmd/internal/downloader"
+	"github.com/unkmonster/tmd/internal/entity"
+	"github.com/unkmonster/tmd/internal/logging"
+	"github.com/unkmonster/tmd/internal/naming"
 	"github.com/unkmonster/tmd/internal/twitter"
 	"github.com/unkmonster/tmd/internal/utils"
 )
@@ -38,10 +40,11 @@ var validImageExts = map[string]bool{
 }
 
 func imageExtFromURL(rawURL string) string {
-	ext, err := utils.GetExtFromUrl(rawURL)
-	if err != nil {
-		ext = pathpkg.Ext(rawURL)
-	}
+	// utils.GetExtFromUrl 覆盖 path.Ext 对解析后 URL path 的提取语义。
+	// 解析失败（畸形 URL）时直接落默认 ".jpg"：旧实现对原始字符串再做一次
+	// pathpkg.Ext 兜底，会把 query/fragment 中的点误判为扩展名且 url.Parse 失败
+	// 的 URL 本就不可下载，故删除该兜底（生产头像/横幅 URL 无解析失败场景）。
+	ext, _ := utils.GetExtFromUrl(rawURL)
 	ext = strings.ToLower(ext)
 	if validImageExts[ext] {
 		return ext
@@ -181,16 +184,12 @@ func (pd *ProfileDownloader) Download(ctx context.Context, req DownloadRequest) 
 		Protected:   req.Protected,
 		CreatedAt:   req.CreatedAt,
 	}
-	log.Debugln("[profile] Using provided profile data for:", req.ScreenName)
+	log.Debugf("[profile] Using provided profile data screen_name=%s", req.ScreenName)
 
 	result.Profile = profile
-	log.Debugln("[profile] Profile fetched:", profile.Name, "(id:", profile.ID, ")")
+	log.Debugf("[profile] Profile ready screen_name=%s name=%q uid=%d", req.ScreenName, profile.Name, profile.ID)
 
-	userTitle := req.UserTitle
-	if userTitle == "" {
-		userTitle = fmt.Sprintf("%s(%s)", profile.Name, req.ScreenName)
-	}
-	userTitle = utils.WinFileNameWithMaxLen(userTitle, pd.config.MaxFileNameLen)
+	userTitle := resolveUserTitle(req, pd.config.MaxFileNameLen)
 
 	var userDir string
 	var err error
@@ -209,7 +208,7 @@ func (pd *ProfileDownloader) Download(ctx context.Context, req DownloadRequest) 
 		}
 	}
 
-	log.Debugln("[profile] Directory ready:", userDir)
+	log.Debugf("[profile] Directory ready screen_name=%s path=%q", req.ScreenName, logging.Path(userDir))
 
 	fetchedAt := time.Now()
 
@@ -243,75 +242,61 @@ func (pd *ProfileDownloader) Download(ctx context.Context, req DownloadRequest) 
 	return result, nil
 }
 
+func resolveUserTitle(req DownloadRequest, maxLen int) string {
+	if req.UserTitle != "" {
+		return utils.WinFileNameWithMaxLen(req.UserTitle, maxLen)
+	}
+	return naming.UserDirTitle(req.Name, req.ScreenName, maxLen)
+}
+
 func (pd *ProfileDownloader) syncUserDirectory(profile *ProfileInfo, userTitle, screenName string) (string, error) {
 	if err := database.SyncUser(pd.db, profile.ID, profile.Name, screenName, profile.Protected, 0, true); err != nil {
-		log.Errorf("[profile] Failed to sync user in database: %v", err)
+		log.Errorf("[profile] User sync failed screen_name=%s uid=%d error=%q", screenName, profile.ID, err.Error())
 		return "", err
 	}
 
-	entity, err := database.LocateUserEntity(pd.db, profile.ID, pd.storage.usersBasePath)
+	pathEntity, err := entity.NewUserEntity(pd.db, profile.ID, pd.storage.usersBasePath)
 	if err != nil {
-		log.Errorf("[profile] Failed to locate user entity: %v", err)
+		log.Errorf("[profile] User entity locate failed screen_name=%s uid=%d parent_dir=%q error=%q", screenName, profile.ID, logging.Path(pd.storage.usersBasePath), err.Error())
 		return "", err
 	}
 
 	expectedTitle := userTitle
-
-	if entity == nil {
-		entity = &database.UserEntity{
-			UserId:    profile.ID,
-			ParentDir: pd.storage.usersBasePath,
-			Name:      expectedTitle,
-		}
-		userDir := filepath.Join(pd.storage.usersBasePath, expectedTitle)
-		if err := os.MkdirAll(userDir, 0755); err != nil {
-			log.Errorf("[profile] Failed to create user directory %s: %v", userDir, err)
+	wasRecorded := pathEntity.Recorded()
+	oldName := ""
+	oldUserDir := ""
+	if wasRecorded {
+		oldName, err = pathEntity.Name()
+		if err != nil {
 			return "", err
 		}
-		if err := database.CreateUserEntity(pd.db, entity); err != nil {
-			log.Errorf("[profile] Failed to create user entity: %v", err)
+		oldUserDir, err = pathEntity.Path()
+		if err != nil {
 			return "", err
 		}
-		log.Infoln("[profile] New user directory created:", userDir)
-		return ensureProfileDirs(userDir)
 	}
-	oldUserDir, err := entity.Path()
+
+	if err := entity.Sync(pathEntity, expectedTitle); err != nil {
+		log.Errorf("[profile] User entity sync failed screen_name=%s uid=%d error=%q", screenName, profile.ID, err.Error())
+		return "", err
+	}
+	userDir, err := pathEntity.Path()
 	if err != nil {
-		log.Errorf("[profile] Failed to get entity path: %v", err)
 		return "", err
 	}
-	if entity.Name == expectedTitle {
-		if err := os.MkdirAll(oldUserDir, 0755); err != nil && !os.IsExist(err) {
-			return "", err
-		}
-		return ensureProfileDirs(oldUserDir)
+	if !wasRecorded {
+		log.Infof("[profile] User directory created screen_name=%s path=%q", screenName, logging.Path(userDir))
+	} else if oldName != expectedTitle {
+		log.Infof("[profile] User directory renamed screen_name=%s old_path=%q new_path=%q", screenName, logging.Path(oldUserDir), logging.Path(userDir))
 	}
-
-	newUserDir := filepath.Join(pd.storage.usersBasePath, expectedTitle)
-	if err := os.Rename(oldUserDir, newUserDir); err != nil {
-		if os.IsNotExist(err) {
-			if mkdirErr := os.MkdirAll(newUserDir, 0755); mkdirErr != nil {
-				return "", mkdirErr
-			}
-		} else {
-			return "", err
-		}
-	}
-
-	entity.Name = expectedTitle
-	if err := database.UpdateUserEntity(pd.db, entity); err != nil {
-		log.Errorf("[profile] Failed to update user entity: %v", err)
-		return "", err
-	}
-	log.Infoln("[profile] User directory renamed:", oldUserDir, "->", newUserDir)
-	return ensureProfileDirs(newUserDir)
+	return ensureProfileDirs(userDir)
 }
 
 func (pd *ProfileDownloader) DownloadMultiple(ctx context.Context, requests []DownloadRequest) []*DownloadResult {
 	if len(requests) == 0 {
 		return nil
 	}
-	log.Infof("[profile] Starting batch profile download for %d users", len(requests))
+	log.Debugf("[profile] Batch download start users=%d", len(requests))
 
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil) // 确保 cancel 在所有情况下都被调用
@@ -337,8 +322,7 @@ func (pd *ProfileDownloader) DownloadMultiple(ctx context.Context, requests []Do
 	}
 
 	wg.Wait()
-	log.Infof("[profile] Batch profile download complete: %d/%d succeeded",
-		completedCount, len(requests))
+	log.Debugf("[profile] Batch download complete succeeded=%d failed=%d total=%d", completedCount-failedCount, failedCount, len(requests))
 	return results
 }
 
@@ -357,7 +341,7 @@ func (pd *ProfileDownloader) profileDownloader(
 	defer wg.Done()
 	defer func() {
 		if p := recover(); p != nil {
-			log.Errorf("[profile] Panic recovered: %v", p)
+			log.Errorf("[profile] Worker panic error=%q", fmt.Sprint(p))
 			cancel(fmt.Errorf("panic: %v", p))
 
 			// 把 channel 中剩余的任务标记为失败
@@ -381,7 +365,7 @@ func (pd *ProfileDownloader) profileDownloader(
 			}
 			result, err := pd.Download(ctx, ir.request)
 			if err != nil {
-				log.Errorln("[profile] Profile download failed:", ir.request.ScreenName, "-", err)
+				log.Errorf("[profile] Download failed screen_name=%s error=%q", ir.request.ScreenName, err.Error())
 
 				if errors.Is(err, syscall.ENOSPC) {
 					cancel(err)
@@ -472,7 +456,7 @@ func (pd *ProfileDownloader) downloadFile(ctx context.Context, userTitle, screen
 
 	result, err := pd.downloader.Download(downloadReq)
 	if err != nil {
-		log.Debugf("[profile] %s download failed for %s: %v", label, screenName, err)
+		log.Debugf("[profile] File download failed screen_name=%s type=%s path=%q error=%q", screenName, label, logging.Path(filePath), err.Error())
 		return FileResult{FileType: fileType, FilePath: filePath, Status: StatusFailed, Error: err}
 	}
 
@@ -489,7 +473,7 @@ func (pd *ProfileDownloader) downloadFile(ctx context.Context, userTitle, screen
 func (pd *ProfileDownloader) saveProfileJSON(userTitle, screenName string, profile *ProfileInfo, fetchedAt time.Time) FileResult {
 	data, err := ProfileToJSON(profile)
 	if err != nil {
-		log.Errorln("[profile] Profile JSON serialize failed:", screenName, "-", err)
+		log.Errorf("[profile] JSON serialize failed screen_name=%s error=%q", screenName, err.Error())
 		filePath := pd.storage.GetFilePath(userTitle, FileTypeProfile)
 		return FileResult{FileType: FileTypeProfile, FilePath: filePath, Status: StatusFailed, Error: err}
 	}
@@ -511,7 +495,7 @@ func (pd *ProfileDownloader) saveContent(userTitle string, fileType FileType, da
 
 	result, err := pd.fileWriter.Write(writeReq)
 	if err != nil {
-		log.Errorf("[profile] Failed to write %s file: %v", fileType, err)
+		log.Errorf("[profile] File write failed type=%s path=%q error=%q", fileType, logging.Path(filePath), err.Error())
 		return FileResult{FileType: fileType, FilePath: filePath, Status: StatusFailed, Error: err}
 	}
 

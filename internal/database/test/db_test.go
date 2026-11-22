@@ -29,7 +29,9 @@ func opentmpdb() *sqlx.DB {
 		panic(err)
 	}
 
-	database.CreateTables(db)
+	if err := database.CreateTables(db); err != nil {
+		panic(err)
+	}
 	return db
 }
 
@@ -201,9 +203,15 @@ func TestUserEntity(t *testing.T) {
 		}
 
 		// update
-		entity.Name = entity.Name + "renamed"
-		if err := database.UpdateUserEntity(db, entity); err != nil {
+		oldName := entity.Name
+		entity.Name += "renamed"
+		updated, err := database.UpdateUserEntityNameIfCurrent(db, int(database.NullInt32(entity.Id)), oldName, entity.Name)
+		if err != nil {
 			t.Error(err)
+			return
+		}
+		if !updated {
+			t.Error("user entity rename unexpectedly reported a stale write")
 			return
 		}
 		yes, err = hasSameUserEntityRecord(db, entity)
@@ -319,9 +327,15 @@ func TestLstEntity(t *testing.T) {
 		}
 
 		// update
-		entity.Name = entity.Name + "renamed"
-		if err = database.UpdateLstEntity(db, entity); err != nil {
+		oldName := entity.Name
+		entity.Name += "renamed"
+		updated, err := database.UpdateLstEntityNameIfCurrent(db, int(database.NullInt32(entity.Id)), oldName, entity.Name)
+		if err != nil {
 			t.Error(err)
+			return
+		}
+		if !updated {
+			t.Error("list entity rename unexpectedly reported a stale write")
 			return
 		}
 		yes, err = hasSameLstEntityRecord(db, entity)

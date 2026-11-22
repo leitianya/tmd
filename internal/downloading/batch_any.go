@@ -3,6 +3,7 @@ package downloading
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/go-resty/resty/v2"
 	"github.com/jmoiron/sqlx"
@@ -25,12 +26,14 @@ type BatchDownloadSummary struct {
 }
 
 func BatchDownloadAny(ctx context.Context, client *resty.Client, db *sqlx.DB, lists []twitter.ListBase, users []*twitter.User, dir string, realDir string, autoFollow bool, additional []*resty.Client, dwn downloader.Downloader, fileWriter downloader.FileWriter, opts RuntimeOptions, progress BatchProgressFunc, lsm *ListSyncManager) (failedTweets []*TweetInEntity, listMembers []*twitter.User, summary BatchDownloadSummary, err error) {
+	start := time.Now()
+	log.Debugf("[batch] Collect start users=%d lists=%d auto_follow=%t", len(users), len(lists), autoFollow)
 
 	for _, lst := range lists {
-		log.Infof("[batch] Downloading %s", lst.Title())
+		log.Debugf("[batch] Collect list queued list=%q", lst.Title())
 	}
 
-	log.Debugln("[batch] Start collecting users")
+	log.Debug("[batch] Collect users start")
 	packgedUsers := make([]userInListEntity, 0)
 	listMembers = make([]*twitter.User, 0)
 	wg := sync.WaitGroup{}
@@ -38,17 +41,25 @@ func BatchDownloadAny(ctx context.Context, client *resty.Client, db *sqlx.DB, li
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 
+	sem := make(chan struct{}, listCollectMaxConcurrent)
 	for _, lst := range lists {
 		wg.Add(1)
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Done()
+			continue
+		}
 		go func(lst twitter.ListBase) {
 			defer wg.Done()
+			defer func() { <-sem }()
 			res, members, e := syncListAndGetMembers(ctx, client, db, lst, dir, opts.normalizedMaxFileNameLen(), lsm)
 			if e != nil {
-				log.Errorf("[batch] Failed to sync list %s: %v", lst.Title(), e)
+				log.Errorf("[batch] Collect list sync failed list=%q error=%q", lst.Title(), e.Error())
 				cancel(e)
 				return
 			}
-			log.Debugf("[batch] Members of %s: %d", lst.Title(), len(res))
+			log.Debugf("[batch] Collect list members list=%q count=%d", lst.Title(), len(res))
 			mtx.Lock()
 			defer mtx.Unlock()
 			packgedUsers = append(packgedUsers, res...)
@@ -61,11 +72,12 @@ func BatchDownloadAny(ctx context.Context, client *resty.Client, db *sqlx.DB, li
 	}
 
 	for _, usr := range users {
-		log.Debugf("[batch] Downloading user: %s", usr.ScreenName)
+		log.Debugf("[batch] Collect user queued user=@%s", usr.ScreenName)
 		packgedUsers = append(packgedUsers, userInListEntity{user: usr, leid: 0})
 	}
 
-	log.Debugln("[batch] Collected users:", len(packgedUsers))
+	log.Debugf("[batch] Collect users complete users=%d", len(packgedUsers))
+	log.Debugf("[batch] Collect complete users=%d list_members=%d dur=%s", len(packgedUsers), len(listMembers), time.Since(start))
 	failedTweets, summary, err = BatchUserDownload(ctx, client, db, packgedUsers, realDir, autoFollow, additional, dwn, fileWriter, opts, progress)
 	return failedTweets, listMembers, summary, err
 }

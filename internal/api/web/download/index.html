@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>TMD · 下载台</title>
+<link rel="stylesheet" href="/static/styles.css">
+<script>
+  // 首帧前应用主题，避免闪白
+  (function () {
+    try {
+      var t = localStorage.getItem("tmd.theme") || "auto";
+      var dark = t === "dark" || (t === "auto" && matchMedia("(prefers-color-scheme: dark)").matches);
+      document.documentElement.dataset.theme = t;
+      document.documentElement.dataset.resolved = dark ? "dark" : "light";
+      document.documentElement.style.colorScheme = dark ? "dark" : "light";
+    } catch (e) {}
+  })();
+</script>
+</head>
+<body>
+<a class="skip-link" href="#main" data-i18n="a11y.skip">跳到主内容</a>
+
+<header class="appbar">
+  <div class="appbar__brand">
+    <span class="logo" aria-hidden="true">
+      <svg viewBox="0 0 1024 1024" fill="currentColor"><path d="M582 88c16 0 28 12 28 28v178h192c23 0 34 28 17 45l-76 76c-5 5-12 8-20 8H610v248c0 80 43 129 130 145 25 5 35 35 19 54l-70 82c-8 9-20 14-32 11-122-27-205-122-205-267V423H274c-24 0-35-29-17-46l77-75c5-5 12-8 19-8h99V116c0-16 12-28 28-28h102Zm-74 335v290c0 102 59 177 153 209l42-49c-99-31-149-101-149-202V423h-46Z"/></svg>
+    </span>
+    <span class="brand">
+      <b>TMD</b>
+      <span class="brand__sub"><span data-i18n="brand.name">下载台</span><span class="brand__dot">·</span><em data-i18n="brand.latin">download desk</em></span>
+    </span>
+  </div>
+
+  <div class="appbar__status" id="status-line">
+    <span class="status" id="status-health" data-state="loading"><span data-i18n="status.checking">健康检查中…</span></span>
+    <span class="status" id="status-queue" data-i18n="status.queueEmpty">队列 —</span>
+    <span class="status" id="status-auth" data-i18n="status.authUnknown">认证 —</span>
+  </div>
+
+  <div class="appbar__controls">
+    <button type="button" class="btn btn--ghost btn--sm btn--icon-text" id="btn-auth" hidden data-i18n="status.changeKey">切换密钥</button>
+
+    <div class="seg" id="theme-seg" role="group" data-i18n-aria="theme.group" aria-label="外观">
+      <button type="button" class="seg__btn" data-theme-set="light" data-i18n-aria="theme.light" data-i18n-title="theme.light" aria-label="浅色" title="浅色">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="3.1"/><g stroke-linecap="round"><path d="M8 1.6v1.8M8 12.6v1.8M1.6 8h1.8M12.6 8h1.8M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></g></svg>
+      </button>
+      <button type="button" class="seg__btn" data-theme-set="auto" data-i18n-aria="theme.auto" data-i18n-title="theme.auto" aria-label="跟随系统" title="跟随系统">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2.4" y="3.4" width="11.2" height="7.6" rx="1.6"/><path d="M5.8 13.2h4.4" stroke-linecap="round"/></svg>
+      </button>
+      <button type="button" class="seg__btn" data-theme-set="dark" data-i18n-aria="theme.dark" data-i18n-title="theme.dark" aria-label="深色" title="深色">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 9.4A5.4 5.4 0 0 1 6.6 3a5.4 5.4 0 1 0 6.4 6.4z"/></svg>
+      </button>
+    </div>
+
+    <div class="seg seg--lang" id="lang-seg" role="group" data-i18n-aria="lang.group" aria-label="语言">
+      <button type="button" class="seg__btn" data-lang-set="zh-CN">中</button>
+      <button type="button" class="seg__btn" data-lang-set="en">EN</button>
+    </div>
+  </div>
+</header>
+
+<nav class="subnav" aria-label="主导航" data-i18n-aria="nav.group">
+  <div class="subnav__inner" id="nav">
+    <a class="tab" href="/" data-nav="overview" data-i18n="nav.overview">总览</a>
+    <a class="tab" href="/tasks" data-nav="tasks" data-i18n="nav.tasks">下载</a>
+    <a class="tab" href="/data" data-nav="data" data-i18n="nav.data">数据</a>
+    <a class="tab" href="/schedules" data-nav="schedules" data-i18n="nav.schedules">计划</a>
+    <a class="tab" href="/logs" data-nav="logs" data-i18n="nav.logs">日志</a>
+    <a class="tab" href="/system" data-nav="system" data-i18n="nav.system">系统</a>
+  </div>
+</nav>
+
+<div class="banner" id="shutdown-banner" role="alert" hidden data-i18n="banner.shutdown">
+  服务器正在关闭，任务已停止接收。恢复后请刷新页面。
+</div>
+
+<main class="page" id="main">
+
+  <section class="view" id="view-overview" data-view="overview" hidden></section>
+
+  <section class="view" id="view-tasks" data-view="tasks">
+    <div class="view-head">
+      <div class="view-head__text">
+        <h1 class="view-title" data-i18n="tasksView.title">下载</h1>
+        <p class="view-sub" data-i18n="tasksView.sub">提交下载、标记已下载与 JSON 上传；进行中与历史任务都在这一页。</p>
+      </div>
+      <div class="view-head__actions">
+        <span class="view-head__stat" id="head-active" data-i18n="tasksView.activeZero">队列空闲</span>
+        <button type="button" class="btn btn--ghost btn--sm" id="btn-refresh" data-i18n="common.refresh">刷新</button>
+      </div>
+    </div>
+
+    <form class="cmdbar" id="dispatch-form" novalidate autocomplete="off">
+      <div class="cmdbar__target">
+        <label class="visually-hidden" for="target-input" data-i18n="step.target">目标</label>
+        <textarea id="target-input" rows="2" spellcheck="false" autocapitalize="off" aria-describedby="parse-hint"
+          data-i18n-placeholder="target.placeholder" placeholder="@handle、x.com 链接、list id、JSON 路径，可多行"></textarea>
+        <span class="tag" id="target-tag" hidden></span>
+      </div>
+      <p class="cmdbar__hint" id="parse-hint" aria-live="polite" data-i18n="target.hint">支持 @screen_name、x.com/twitter.com 链接、数字 list id、JSON 文件路径</p>
+
+      <div class="cmdbar__following" id="batch-following-wrap" hidden>
+        <label class="cmdbar__following-label" for="batch-following" data-i18n="batch.followingLabel">关注源</label>
+        <input class="input" id="batch-following" type="text" spellcheck="false" autocapitalize="off" autocomplete="off"
+          data-i18n-placeholder="batch.followingPlaceholder" placeholder="@name1, @name2（下载这些账号关注的人）">
+        <span class="field__help" data-i18n="batch.followingHelp">与上方用户/列表是不同目标：这里下载这些账号关注的人。</span>
+      </div>
+
+      <div class="cmdbar__row">
+        <div class="segmented segmented--scroll" id="mode-group" role="radiogroup" data-i18n-aria="mode.group" aria-label="下载方式"></div>
+        <div class="opts" id="options-group"></div>
+        <span class="cmdbar__grow"></span>
+        <span class="kbd-hint" data-i18n="submit.note">⌘/Ctrl + Enter</span>
+        <button type="submit" class="btn btn--primary" id="submit-btn">
+          <span class="btn__text" data-i18n="submit.go">开始下载</span>
+        </button>
+      </div>
+
+      <div class="cmdbar__extras">
+        <label class="option option--compact" title="mark">
+          <input type="checkbox" id="mark-toggle">
+          <span class="option__box" aria-hidden="true"></span>
+          <span data-i18n="mark.toggle">仅标记为已下载（不下载媒体）</span>
+        </label>
+        <div class="cmdbar__marktime" id="mark-time-wrap" hidden>
+          <label class="visually-hidden" for="mark-time" data-i18n="mark.timeLabel">标记时间（可选）</label>
+          <input class="input input--compact" type="datetime-local" id="mark-time">
+          <span class="field__help" data-i18n="mark.timeHelp">留空表示标记到此刻。</span>
+        </div>
+        <div class="cmdbar__upload" id="upload-field" hidden>
+          <label class="btn btn--ghost btn--sm" for="json-files">
+            <span data-i18n="upload.label">上传 .json 文件</span>
+          </label>
+          <input type="file" id="json-files" accept=".json,application/json" multiple class="visually-hidden">
+          <label class="btn btn--ghost btn--sm" for="json-folder">
+            <span data-i18n="upload.folder">上传文件夹</span>
+          </label>
+          <input type="file" id="json-folder" webkitdirectory directory multiple class="visually-hidden">
+          <span class="field__help" data-i18n="upload.help">单文件 ≤400MB，仅 .json；上传生成的任务不可重试。</span>
+          <span class="field__help" id="upload-files"></span>
+        </div>
+      </div>
+
+      <p class="form-error" id="form-error" role="alert" hidden></p>
+    </form>
+
+    <section class="live" id="queue-section" aria-labelledby="queue-title" hidden>
+      <header class="live__head">
+        <h2 class="live__title" id="queue-title">
+          <span data-i18n="queue.title">进行中</span>
+          <span class="count" id="queue-count">0</span>
+        </h2>
+        <div class="live__actions">
+          <button type="button" class="btn btn--ghost btn--sm" id="btn-cancel-queued" disabled data-i18n="queue.cancelQueued">取消排队</button>
+        </div>
+      </header>
+      <div class="queue" id="queue" aria-live="polite" aria-relevant="additions text"></div>
+    </section>
+
+    <section class="errorspanel" id="errors-strip" hidden aria-labelledby="errors-title">
+      <div class="errorspanel__head">
+        <span class="errorspanel__icon" aria-hidden="true">
+          <svg viewBox="0 0 16 16" fill="none"><path d="M8 2.2 14.2 13H1.8Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M8 6.4v3.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="8" cy="11.3" r=".85" fill="currentColor"/></svg>
+        </span>
+        <h2 class="errorspanel__title" id="errors-title">
+          <span data-i18n="errors.title">失败记录</span>
+          <span class="count" id="errors-count" data-tone="warn"></span>
+        </h2>
+        <span class="errorspanel__text" id="errors-summary"></span>
+        <button type="button" class="btn btn--ghost btn--sm errorspanel__toggle" id="errors-toggle" aria-expanded="false" aria-controls="errors-body" data-i18n="errors.details">明细</button>
+        <div class="errorspanel__actions">
+          <button type="button" class="btn btn--ghost btn--sm" id="btn-retry-all" data-i18n="errors.retryAll">全部重试</button>
+          <button type="button" class="btn btn--ghost btn--sm btn--danger" id="btn-clear-errors" data-i18n="errors.clear">清除记录</button>
+        </div>
+      </div>
+      <div class="errorspanel__body" id="errors-body" hidden></div>
+    </section>
+
+    <section class="card card--ledger" aria-labelledby="ledger-title">
+      <header class="card__head card__head--ledger">
+        <h2 class="card__title" id="ledger-title">
+          <span data-i18n="ledger.title">台账</span>
+          <span class="count" id="ledger-total" hidden></span>
+        </h2>
+        <label class="search">
+          <svg class="search__icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7.2" cy="7.2" r="4.2"/><path d="M10.4 10.4L14 14" stroke-linecap="round"/></svg>
+          <span class="visually-hidden" data-i18n="ledger.searchLabel">搜索台账</span>
+          <input type="search" id="ledger-search" data-i18n-placeholder="ledger.search" placeholder="搜索目标 / 任务 ID（/）" autocomplete="off">
+        </label>
+      </header>
+
+      <div class="ledger__bar">
+        <div class="filters filters--chips" id="ledger-filters" role="group" data-i18n-aria="ledger.filterGroup" aria-label="按状态过滤"></div>
+        <div class="ledger__bulk">
+          <label class="visually-hidden" for="ledger-type" data-i18n="ledger.typeLabel">按类型过滤</label>
+          <select class="select select--sm" id="ledger-type"></select>
+          <label class="visually-hidden" for="ledger-stage" data-i18n="ledger.stageLabel">按阶段过滤</label>
+          <select class="select select--sm" id="ledger-stage"></select>
+          <button type="button" class="btn btn--ghost btn--sm" id="btn-batch-retry" disabled data-i18n="ledger.batchRetry">重试失败</button>
+          <button type="button" class="btn btn--ghost btn--sm btn--danger" id="btn-batch-delete" disabled data-i18n="ledger.batchDelete">清理终态</button>
+        </div>
+      </div>
+
+      <div class="ledger__selection" id="ledger-selection" hidden>
+        <span class="ledger__selection-text" id="ledger-selection-text" aria-live="polite"></span>
+        <div class="ledger__selection-actions">
+          <button type="button" class="btn btn--ghost btn--sm" id="btn-selection-clear" data-i18n="selection.clear">取消选择</button>
+          <button type="button" class="btn btn--ghost btn--sm" id="btn-selection-cancel" data-i18n="selection.cancel">取消任务</button>
+          <button type="button" class="btn btn--ghost btn--sm" id="btn-selection-retry" data-i18n="selection.retry">重试任务</button>
+          <button type="button" class="btn btn--ghost btn--sm btn--danger" id="btn-selection-delete" data-i18n="selection.delete">删除记录</button>
+        </div>
+      </div>
+
+      <div class="ledger__head">
+        <span class="ledger__check"><input type="checkbox" id="ledger-select-all" data-i18n-aria="selection.all" aria-label="选择当前列表全部任务"></span>
+        <span data-i18n="ledger.colStatus">状态</span>
+        <span data-i18n="ledger.colTarget">目标</span>
+        <span data-i18n="ledger.colProgress">进度</span>
+        <span data-i18n="ledger.colTime">时间</span>
+        <span data-i18n="ledger.colActions">操作</span>
+      </div>
+
+      <div class="ledger" id="ledger"></div>
+      <div class="empty empty--ledger" id="ledger-empty" hidden>
+        <p class="empty__title" id="ledger-empty-text"></p>
+        <div class="empty__actions" id="ledger-empty-actions"></div>
+      </div>
+      <nav class="pager ledger__pager" id="ledger-pager" hidden data-i18n-aria="ledger.pagerLabel" aria-label="台账分页"></nav>
+    </section>
+  </section>
+
+  <section class="view" id="view-data" data-view="data" hidden></section>
+  <section class="view" id="view-schedules" data-view="schedules" hidden></section>
+  <section class="view" id="view-logs" data-view="logs" hidden></section>
+  <section class="view" id="view-system" data-view="system" hidden></section>
+
+  <footer class="footer">
+    <span id="footer-note" data-i18n="footer.note">TMD 下载台 · 单页零构建</span>
+    <a class="footer__link" id="footer-repo" href="https://github.com/Leexunhuan743/twitter_media_downloader_pro" target="_blank" rel="noopener noreferrer">
+      <svg class="footer__icon" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+      <span data-i18n="footer.repo">GitHub 仓库</span>
+    </a>
+    <span id="footer-version" data-i18n="footer.version">版本 —</span>
+  </footer>
+</main>
+
+<dialog class="modal" id="confirm-dialog" aria-labelledby="confirm-title">
+  <div class="modal__form">
+    <div class="modal__head">
+      <div>
+        <h3 class="modal__title" id="confirm-title"></h3>
+        <p class="modal__desc" id="confirm-desc"></p>
+      </div>
+    </div>
+    <div class="modal__actions">
+      <button type="button" class="btn btn--ghost" id="confirm-cancel" data-confirm="false"></button>
+      <button type="button" class="btn btn--primary" id="confirm-ok" data-confirm="true"></button>
+    </div>
+  </div>
+</dialog>
+
+<div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+
+<dialog class="modal modal--wide" id="task-dialog" aria-labelledby="task-title">
+  <div class="modal__form">
+    <div class="modal__head">
+      <h2 class="modal__title" id="task-title" data-i18n="detail.title">任务详情</h2>
+      <button type="button" class="modal__close" id="task-close" data-i18n-aria="common.close" aria-label="关闭">×</button>
+    </div>
+    <div id="task-body"></div>
+    <div class="modal__actions">
+      <button type="button" class="btn btn--ghost" id="task-dialog-close" data-i18n="detail.close">关闭</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog class="auth" id="auth-dialog" aria-labelledby="auth-title">
+  <form method="dialog" class="auth__form" id="auth-form">
+    <h2 class="auth__title" id="auth-title" data-i18n="auth.title">需要 API Key</h2>
+    <p class="auth__desc" data-i18n="auth.desc">当前服务已开启访问认证。输入配置里的 api_key 换取会话令牌，令牌只保存在本机浏览器。</p>
+    <label class="auth__label" for="auth-key" data-i18n="auth.label">API Key</label>
+    <input class="auth__input" id="auth-key" type="password" autocomplete="current-password" spellcheck="false" data-i18n-placeholder="auth.placeholder" placeholder="粘贴 api_key">
+    <p class="auth__error" id="auth-error" role="alert" hidden></p>
+    <div class="auth__actions">
+      <button type="button" class="btn btn--ghost" id="auth-cancel" data-i18n="auth.cancel">取消</button>
+      <button type="submit" class="btn btn--primary" id="auth-submit" data-i18n="auth.submit">登录</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="/static/app.js"></script>
+<script src="/static/overview.js"></script>
+<script src="/static/data.js"></script>
+<script src="/static/schedules.js"></script>
+<script src="/static/logs.js"></script>
+<script src="/static/config.js"></script>
+</body>
+</html>

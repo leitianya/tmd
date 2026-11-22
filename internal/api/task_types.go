@@ -35,9 +35,9 @@ const (
 type RetryTaskResult string
 
 const (
-	RetryTaskResultSuccess       RetryTaskResult = "success"
-	RetryTaskResultNotFound      RetryTaskResult = "not_found"
-	RetryTaskResultNotRetryable  RetryTaskResult = "not_retryable"
+	RetryTaskResultSuccess      RetryTaskResult = "success"
+	RetryTaskResultNotFound     RetryTaskResult = "not_found"
+	RetryTaskResultNotRetryable RetryTaskResult = "not_retryable"
 )
 
 // TaskType 任务类型
@@ -56,6 +56,13 @@ const (
 	TaskTypeRetryAllFailed     TaskType = "retry_all_failed"
 )
 
+// TaskCreateOptions contains metadata that must exist before a task's first
+// snapshot and SSE publication. It intentionally excludes mutable lifecycle
+// fields, which remain owned by TaskManager.
+type TaskCreateOptions struct {
+	EntryID string
+}
+
 // Task 任务
 type Task struct {
 	ID        string             `json:"task_id"`
@@ -73,9 +80,36 @@ type Task struct {
 	Cancel    context.CancelFunc `json:"-"`
 }
 
+// TaskStage 是 TaskProgress.Stage 的取值集合。
+// 前端台账按阶段过滤的可选值由 /tasks/query 的 stage 参数白名单决定，两者共用本表。
+type TaskStage string
+
+const (
+	TaskStageSyncing        TaskStage = "syncing"
+	TaskStageResolving      TaskStage = "resolving"
+	TaskStageDownloading    TaskStage = "downloading"
+	TaskStageRetrying       TaskStage = "retrying"
+	TaskStageProfile        TaskStage = "profile"
+	TaskStageProfileWarning TaskStage = "profile_warning"
+	TaskStageMarking        TaskStage = "marking"
+	TaskStageCompleted      TaskStage = "completed"
+)
+
+// taskStages 是阶段白名单的唯一来源：parseTaskStageFilter 校验 /tasks/query?stage=。
+var taskStages = []TaskStage{
+	TaskStageSyncing,
+	TaskStageResolving,
+	TaskStageDownloading,
+	TaskStageRetrying,
+	TaskStageProfile,
+	TaskStageProfileWarning,
+	TaskStageMarking,
+	TaskStageCompleted,
+}
+
 // TaskProgress 任务进度
 type TaskProgress struct {
-	Stage     string `json:"stage"` // "syncing", "downloading", "retrying", "profile", "profile_warning", "marking", "completed"
+	Stage     string `json:"stage"` // 取值见 TaskStage
 	Total     int    `json:"total"`
 	Completed int    `json:"completed"`
 	Failed    int    `json:"failed"`
@@ -95,10 +129,14 @@ type TaskProfileResult struct {
 }
 
 type TaskResult struct {
-	Main    *TaskMainResult    `json:"main,omitempty"`
-	Profile *TaskProfileResult `json:"profile,omitempty"`
-	Message string             `json:"message,omitempty"`
+	Main          *TaskMainResult    `json:"main,omitempty"`
+	Profile       *TaskProfileResult `json:"profile,omitempty"`
+	Message       string             `json:"message,omitempty"`
+	FailedDetails []string           `json:"failed_details,omitempty"`
 }
+
+// maxTaskFailedDetails 限制任务结果里保留的失败明细条数，避免响应与 SSE 帧膨胀。
+const maxTaskFailedDetails = 50
 
 func taskTypeName(t TaskType) string {
 	switch t {

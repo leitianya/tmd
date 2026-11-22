@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -53,6 +54,12 @@ type Scheduler struct {
 	started        bool
 	firstStart     bool
 	hasEverStarted bool
+	stopRequested  bool
+	// OnStatusChange 在状态更新后的调度器 goroutine 内同步调用。回调不得
+	// 再调用 Scheduler 的生命周期方法（Start/Stop/Reload）：Stop 会
+	// wg.Wait 等待当前 goroutine，造成自等死锁。IsRunning 不持 lifecycleMu，
+	// 在回调里查询运行状态是安全的。服务器实际回调只做 eventBus 发布
+	// （非阻塞），不触生命周期。
 	OnStatusChange ScheduleStatusChangeFunc
 }
 
@@ -97,20 +104,16 @@ func (sc *Scheduler) readConfig() ([]ScheduleEntry, []*ParsedSchedule, []Schedul
 		return nil, nil, nil, err
 	}
 
-	parsed := make([]*ParsedSchedule, len(entries))
+	parsed, err := ValidateAndParseEntries(entries)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
 	statuses := make([]ScheduleStatus, len(entries))
 	for i, entry := range entries {
-		if err := ValidateEntry(entry); err != nil {
-			return nil, nil, nil, fmt.Errorf("schedule #%d (%s): %w", i+1, entry.Name, err)
-		}
-		p, err := ParseSchedule(entry.Schedule)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("schedule #%d (%s): %w", i+1, entry.Name, err)
-		}
-		parsed[i] = p
 		statuses[i] = ScheduleStatus{
 			Entry:           entry,
-			ScheduleDisplay: FormatScheduleDisplay(p, entry.Schedule),
+			ScheduleDisplay: FormatScheduleDisplay(parsed[i], entry.Schedule),
 		}
 	}
 
@@ -121,11 +124,18 @@ func (sc *Scheduler) Start() {
 	sc.lifecycleMu.Lock()
 	defer sc.lifecycleMu.Unlock()
 
+	if sc.stopRequested {
+		// 关停已在启动前触发（Server.Start 与 GracefulShutdown 并发窗口）：
+		// 不再启动任何循环，避免 Stop 的 no-op 之后调度器无人收尾。
+		log.Debug("[scheduler] Start skipped reason=stop_requested")
+		return
+	}
+
 	activeCount, started := sc.startLocked(true)
 	if !started {
 		return
 	}
-	log.Infof("[scheduler] Scheduler started with %d active schedules (total: %d)", activeCount, len(sc.entries))
+	log.Infof("[scheduler] Started active=%d total=%d", activeCount, len(sc.entries))
 }
 
 func (sc *Scheduler) Stop() {
@@ -133,10 +143,10 @@ func (sc *Scheduler) Stop() {
 	defer sc.lifecycleMu.Unlock()
 
 	if !sc.stopLocked() {
-		log.Debugln("[scheduler] Stop: already stopped, skipping")
+		log.Debug("[scheduler] Stop skipped reason=already_stopped")
 		return
 	}
-	log.Infoln("[scheduler] Scheduler stopped")
+	log.Info("[scheduler] Stopped")
 }
 
 func (sc *Scheduler) startLocked(skipIfRunning bool) (int, bool) {
@@ -151,19 +161,20 @@ func (sc *Scheduler) startLocked(skipIfRunning bool) (int, bool) {
 		return 0, false
 	}
 
-	log.Debugln("[scheduler] Start: initializing context and launching goroutines")
+	log.Debug("[scheduler] Start launch begin")
 	return sc.launchGoroutinesLocked(), true
 }
 
 func (sc *Scheduler) stopLocked() bool {
-	log.Debugln("[scheduler] Stop: acquiring mu...")
+	log.Debug("[scheduler] Stop lock begin")
 	sc.mu.Lock()
+	sc.stopRequested = true
 	if !sc.started {
 		sc.mu.Unlock()
 		return false
 	}
 
-	log.Debugln("[scheduler] Stop: cancelling context and waiting for goroutines")
+	log.Debug("[scheduler] Stop waiting for goroutines")
 	if sc.cancel != nil {
 		sc.cancel()
 	}
@@ -182,8 +193,8 @@ func (sc *Scheduler) launchGoroutinesLocked() int {
 		if !entry.Enabled {
 			continue
 		}
-		if i >= len(sc.parsed) || i >= len(sc.statuses) {
-			log.Warnf("[scheduler] launchGoroutinesLocked[%d]: inconsistent scheduler state, skipping entry %q", i, entry.Name)
+		if i >= len(sc.parsed) || i >= len(sc.statuses) || sc.parsed[i] == nil {
+			log.Warnf("[scheduler] Launch skipped index=%d name=%q reason=inconsistent_state", i, entry.Name)
 			continue
 		}
 		activeCount++
@@ -222,24 +233,24 @@ func (sc *Scheduler) entrySnapshot(idx int) (ScheduleEntry, *ParsedSchedule, con
 }
 
 func (sc *Scheduler) Reload() error {
-	log.Debugln("[scheduler] Reload: acquiring lifecycleMu...")
+	log.Debug("[scheduler] Reload lock begin")
 	sc.lifecycleMu.Lock()
-	log.Debugln("[scheduler] Reload: lifecycleMu acquired")
+	log.Debug("[scheduler] Reload lock acquired")
 
 	wasStarted := sc.isRunningLockedLifecycle()
-	log.Debugf("[scheduler] Reload: wasStarted=%v, stopping scheduler", wasStarted)
+	log.Debugf("[scheduler] Reload stopping was_started=%t", wasStarted)
 
 	if wasStarted && sc.stopLocked() {
-		log.Infoln("[scheduler] Scheduler stopped (for reload)")
+		log.Info("[scheduler] Stopped reason=reload")
 	}
 
 	entries, parsed, statuses, err := sc.readConfig()
 	if err != nil {
-		log.Warnf("[scheduler] Reload: readConfig failed (wasStarted=%v): %v", wasStarted, err)
+		log.Warnf("[scheduler] Reload failed was_started=%t error=%q", wasStarted, err.Error())
 		if wasStarted {
-			log.Debugln("[scheduler] Reload: recovering start after readConfig failure")
+			log.Debug("[scheduler] Reload recovery start")
 			activeCount, _ := sc.startLocked(false)
-			log.Infof("[scheduler] Scheduler recovered with %d active schedules", activeCount)
+			log.Infof("[scheduler] Recovered active=%d", activeCount)
 		}
 		callback, running, statusesCopy := sc.statusChangeSnapshot()
 		sc.lifecycleMu.Unlock()
@@ -250,10 +261,9 @@ func (sc *Scheduler) Reload() error {
 	sc.applyConfig(entries, parsed, statuses)
 
 	if wasStarted {
-		log.Debugln("[scheduler] Restarting scheduler after reload")
-		log.Debugln("[scheduler] Reload: starting fresh goroutines")
+		log.Debug("[scheduler] Reload restart begin")
 		activeCount, _ := sc.startLocked(false)
-		log.Infof("[scheduler] Scheduler restarted with %d active schedules", activeCount)
+		log.Infof("[scheduler] Restarted active=%d", activeCount)
 	}
 
 	callback, running, statusesCopy := sc.statusChangeSnapshot()
@@ -263,10 +273,13 @@ func (sc *Scheduler) Reload() error {
 	return nil
 }
 
+// IsRunning 只读 started 标志，不抢 lifecycleMu：OnStatusChange 回调在
+// 调度器 goroutine 内同步调用，若这里等 lifecycleMu，回调里调用 IsRunning
+// 会和持有该锁等待 wg 的 Stop 互等死锁。
 func (sc *Scheduler) IsRunning() bool {
-	sc.lifecycleMu.Lock()
-	defer sc.lifecycleMu.Unlock()
-	return sc.isRunningLockedLifecycle()
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	return sc.started
 }
 
 func (sc *Scheduler) isRunningLockedLifecycle() bool {
@@ -278,9 +291,7 @@ func (sc *Scheduler) isRunningLockedLifecycle() bool {
 func (sc *Scheduler) GetStatuses() []ScheduleStatus {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
-	result := make([]ScheduleStatus, len(sc.statuses))
-	copy(result, sc.statuses)
-	return result
+	return cloneStatuses(sc.statuses)
 }
 
 func (sc *Scheduler) Trigger(index int) (string, error) {
@@ -308,7 +319,7 @@ func (sc *Scheduler) findEnabledEntry(index int) (int, ScheduleEntry, error) {
 	}
 	entry := sc.entries[index]
 	if !entry.Enabled {
-		return 0, ScheduleEntry{}, fmt.Errorf("schedule #%d (%s) is disabled", index+1, entry.Name)
+		return 0, ScheduleEntry{}, fmt.Errorf("%w: schedule #%d (%s)", ErrScheduleDisabled, index+1, entry.Name)
 	}
 	return index, entry, nil
 }
@@ -327,77 +338,38 @@ func (sc *Scheduler) findEnabledEntryByID(id string) (int, ScheduleEntry, error)
 		}
 	}
 	if index < 0 {
-		return 0, ScheduleEntry{}, fmt.Errorf("schedule %q not found", id)
+		return 0, ScheduleEntry{}, fmt.Errorf("%w: schedule %q", ErrScheduleNotFound, id)
 	}
 	if !entry.Enabled {
-		return 0, ScheduleEntry{}, fmt.Errorf("schedule %q (%s) is disabled", id, entry.Name)
+		return 0, ScheduleEntry{}, fmt.Errorf("%w: schedule %q (%s)", ErrScheduleDisabled, id, entry.Name)
 	}
 	return index, entry, nil
 }
 
-func (sc *Scheduler) triggerEntry(index int, entry ScheduleEntry) (taskID string, err error) {
+func (sc *Scheduler) triggerEntry(index int, entry ScheduleEntry) (string, error) {
 	gen, ok := sc.tryAcquireExecution(index, entry, nil)
 	if !ok {
-		return "", fmt.Errorf("schedule %q is already triggering, please wait for the current trigger to complete", entry.Name)
+		return "", fmt.Errorf("%w: schedule %q", ErrScheduleAlreadyTriggering, entry.Name)
 	}
 
-	var released bool
-	defer func() {
-		// 安全网：确保 Triggering 被释放
-		if !released {
-			sc.releaseTriggeringLocked(index, gen)
-		}
-		if r := recover(); r != nil {
-			if !released {
-				now := time.Now()
-				sc.releaseAndUpdateStatus(index, entry, gen, func(status *ScheduleStatus) {
-					status.LastRunAt = &now
-					status.RunCount++
-					status.LastError = fmt.Sprintf("panic: %v", r)
-					status.ConsecutiveFailures++
-				})
-				released = true
-			}
-			panic(r)
-		}
-	}()
-
-	taskID = sc.downloadFunc(entry)
+	taskID, taskErr := sc.executeEntry(index, entry, gen)
 	if taskID == "" {
-		released = sc.releaseAndUpdateStatus(index, entry, gen, func(status *ScheduleStatus) {
-			now := time.Now()
-			status.LastRunAt = &now
-			status.RunCount++
-			status.LastError = "download function returned empty task_id"
-			status.ConsecutiveFailures++
-		})
-		if !released {
-			log.Warnf("[scheduler] TriggerEntry[%d]: status update rejected for empty-task_id failure on entry %q", index, entry.Name)
+		if taskErr != nil {
+			log.Warnf("[scheduler] Manual trigger failed type=%s target=%s name=%q error=%q", entry.Type, entry.Target, entry.Name, taskErr.Error())
+			return "", taskErr
 		}
-		log.Warnf("[scheduler] Manual trigger failed [%s]: target=%s name=%q (empty task_id)", entry.Type, entry.Target, entry.Name)
+		log.Warnf("[scheduler] Manual trigger failed type=%s target=%s name=%q reason=empty_task_id", entry.Type, entry.Target, entry.Name)
 		return "", fmt.Errorf("download function returned empty task_id")
 	}
 
-	released = sc.releaseAndUpdateStatus(index, entry, gen, func(status *ScheduleStatus) {
-		now := time.Now()
-		status.LastRunAt = &now
-		status.LastTaskID = taskID
-		status.LastError = ""
-		status.RunCount++
-		status.ConsecutiveFailures = 0
-	})
-	if !released {
-		log.Warnf("[scheduler] TriggerEntry[%d]: status update rejected for successful trigger on entry %q (task_id=%s)", index, entry.Name, taskID)
-	}
-
-	log.Infof("[scheduler] Manual trigger [%s]: target=%s name=%q task_id=%s", entry.Type, entry.Target, entry.Name, taskID)
+	log.Infof("[scheduler] Manual trigger type=%s target=%s name=%q task_id=%s", entry.Type, entry.Target, entry.Name, taskID)
 	return taskID, nil
 }
 
 func (sc *Scheduler) runLoop(idx int) {
 	entry, parsed, ctx, firstStart, gen, ok := sc.entrySnapshot(idx)
 	if !ok {
-		log.Warnf("[scheduler] runLoop[%d]: invalid schedule index, exiting", idx)
+		log.Warnf("[scheduler] Run loop exit index=%d reason=invalid_schedule_index", idx)
 		return
 	}
 
@@ -417,7 +389,7 @@ func (sc *Scheduler) isStale(gen int64) bool {
 
 func (sc *Scheduler) runIntervalLoop(ctx context.Context, idx int, entry ScheduleEntry, parsed *ParsedSchedule, firstStart bool, gen int64) {
 	if sc.isStale(gen) {
-		log.Warnf("[scheduler] runIntervalLoop[%d]: stale generation detected on entry, exiting", idx)
+		log.Debugf("[scheduler] Interval loop exit index=%d name=%q reason=stale_generation", idx, entry.Name)
 		return
 	}
 	if entry.RunOnStart && firstStart {
@@ -437,7 +409,7 @@ func (sc *Scheduler) runIntervalLoop(ctx context.Context, idx int, entry Schedul
 		select {
 		case <-ticker.C:
 			if sc.isStale(gen) {
-				log.Warnf("[scheduler] runIntervalLoop[%d]: stale generation at tick, exiting", idx)
+				log.Debugf("[scheduler] Interval loop exit index=%d name=%q reason=stale_generation_at_tick", idx, entry.Name)
 				return
 			}
 			sc.execute(idx, entry, gen)
@@ -464,7 +436,7 @@ func (sc *Scheduler) waitInterval(ctx context.Context, idx int, entry ScheduleEn
 
 func (sc *Scheduler) runDailyLoop(ctx context.Context, idx int, entry ScheduleEntry, parsed *ParsedSchedule, firstStart bool, gen int64) {
 	if sc.isStale(gen) {
-		log.Warnf("[scheduler] runDailyLoop[%d]: stale generation detected on entry, exiting", idx)
+		log.Debugf("[scheduler] Daily loop exit index=%d name=%q reason=stale_generation", idx, entry.Name)
 		return
 	}
 	if entry.RunOnStart && firstStart {
@@ -474,7 +446,7 @@ func (sc *Scheduler) runDailyLoop(ctx context.Context, idx int, entry ScheduleEn
 	for {
 		next := nextDailyTrigger(parsed.SortedTimes)
 		if next.IsZero() {
-			log.Warnf("[scheduler] runDailyLoop[%d]: empty times, stopping daily loop", idx)
+			log.Warnf("[scheduler] Daily loop exit index=%d name=%q reason=empty_times", idx, entry.Name)
 			return
 		}
 		sc.updateNextRunAt(idx, entry, next, gen)
@@ -483,7 +455,7 @@ func (sc *Scheduler) runDailyLoop(ctx context.Context, idx int, entry ScheduleEn
 		select {
 		case <-timer.C:
 			if sc.isStale(gen) {
-				log.Warnf("[scheduler] runDailyLoop[%d]: stale generation at daily trigger, exiting", idx)
+				log.Debugf("[scheduler] Daily loop exit index=%d name=%q reason=stale_generation_at_trigger", idx, entry.Name)
 				return
 			}
 			sc.execute(idx, entry, gen)
@@ -501,73 +473,91 @@ func (sc *Scheduler) runDailyLoop(ctx context.Context, idx int, entry ScheduleEn
 
 func (sc *Scheduler) updateNextRunAt(idx int, entry ScheduleEntry, next time.Time, gen int64) {
 	if sc.isStale(gen) {
-		log.Warnf("[scheduler] updateNextRunAt[%d]: skipping stale update for entry %q", idx, entry.Name)
+		log.Debugf("[scheduler] Next run update skipped index=%d name=%q reason=stale_generation", idx, entry.Name)
 		return
 	}
 	if !sc.updateStatus(idx, entry, func(status *ScheduleStatus) {
 		status.NextRunAt = &next
 	}) {
-		log.Warnf("[scheduler] updateNextRunAt[%d]: status update rejected (entry %q may have been reloaded)", idx, entry.Name)
+		log.Warnf("[scheduler] Next run update rejected index=%d name=%q reason=status_mismatch", idx, entry.Name)
 	}
 }
 
 func (sc *Scheduler) execute(idx int, entry ScheduleEntry, gen int64) {
 	if sc.isStale(gen) {
-		log.Warnf("[scheduler] execute[%d]: skipping stale execution for entry %q", idx, entry.Name)
+		log.Debugf("[scheduler] Execution skipped index=%d name=%q reason=stale_generation", idx, entry.Name)
 		return
 	}
 	acquiredGen, ok := sc.tryAcquireExecution(idx, entry, &gen)
 	if !ok {
-		log.Infof("[scheduler] execute[%d]: entry %q is already triggering, skipping duplicate trigger", idx, entry.Name)
+		log.Infof("[scheduler] Execution skipped index=%d name=%q reason=already_triggering", idx, entry.Name)
 		return
 	}
 
-	var taskID string
-	var released bool
+	taskID, taskErr := sc.executeEntry(idx, entry, acquiredGen)
+
+	if taskID != "" {
+		log.Infof("[scheduler] Scheduled trigger type=%s target=%s name=%q task_id=%s", entry.Type, entry.Target, entry.Name, taskID)
+	} else if taskErr != nil {
+		log.Warnf("[scheduler] Scheduled trigger failed type=%s target=%s name=%q error=%q", entry.Type, entry.Target, entry.Name, taskErr.Error())
+	} else {
+		log.Warnf("[scheduler] Scheduled trigger failed type=%s target=%s name=%q reason=empty_task_id", entry.Type, entry.Target, entry.Name)
+	}
+}
+
+// executeEntry 在已取得 Triggering 标志后执行一次下载，并统一负责三种收尾：
+// 记录执行结果、清除 Triggering、把 panic 转成结构化错误。手动触发（triggerEntry）
+// 与定时触发（execute）共用，避免两条路径的恢复逻辑各写一份而分叉。
+// panic 时返回的错误非空，调用方不会拿到「空 taskID 且无错误」的结果。
+func (sc *Scheduler) executeEntry(idx int, entry ScheduleEntry, gen int64) (taskID string, runErr error) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Errorf("[scheduler] execute[%d]: panic in downloadFunc for entry %q: %v", idx, entry.Name, r)
+			log.Errorf("[scheduler] Execution panic index=%d name=%q error=%q", idx, entry.Name, fmt.Sprint(r))
 			now := time.Now()
-			sc.releaseAndUpdateStatus(idx, entry, acquiredGen, func(status *ScheduleStatus) {
+			released := sc.releaseAndUpdateStatus(idx, entry, gen, func(status *ScheduleStatus) {
 				status.LastRunAt = &now
 				status.RunCount++
 				status.LastError = fmt.Sprintf("panic: %v", r)
 				status.ConsecutiveFailures++
 			})
-			released = true
-			return
-		}
-		// 正常返回路径的安全网：releaseAndUpdateStatus 可能因 generation 变更
-		// 返回 false 而跳过清理，这里兜底释放 Triggering。
-		if !released {
-			sc.releaseTriggeringLocked(idx, acquiredGen)
+			if !released {
+				sc.releaseTriggeringLocked(idx, gen)
+			}
+			taskID = ""
+			runErr = fmt.Errorf("panic: %v", r)
 		}
 	}()
 
-	taskID = sc.downloadFunc(entry)
-
-	released = sc.releaseAndUpdateStatus(idx, entry, acquiredGen, func(status *ScheduleStatus) {
-		now := time.Now()
-		status.LastRunAt = &now
-		status.RunCount++
-		if taskID != "" {
-			status.LastTaskID = taskID
-			status.LastError = ""
-			status.ConsecutiveFailures = 0
-		} else {
-			status.LastError = "download function returned empty task_id"
-			status.ConsecutiveFailures++
-		}
+	taskID, runErr = sc.downloadFunc(entry)
+	released := sc.releaseAndUpdateStatus(idx, entry, gen, func(status *ScheduleStatus) {
+		recordExecutionResult(status, taskID, runErr)
 	})
 	if !released {
-		log.Warnf("[scheduler] execute[%d]: status update rejected for entry %q (reloaded?), task_id=%s", idx, entry.Name, taskID)
+		sc.releaseTriggeringLocked(idx, gen)
+		log.Warnf("[scheduler] Status update rejected index=%d name=%q task_id=%s reason=status_mismatch", idx, entry.Name, taskID)
 	}
+	return taskID, runErr
+}
 
+// recordExecutionResult 记录一次执行结果的状态字段：运行时间、taskID 与连续失败计数。
+// taskID 为空表示下载函数未返回任务 ID，按失败记录；runErr 携带真实失败原因
+// （如入队被拒），为空时回退到通用 "empty task_id" 文案。triggerEntry 与 execute 共用。
+func recordExecutionResult(status *ScheduleStatus, taskID string, runErr error) {
+	now := time.Now()
+	status.LastRunAt = &now
+	status.RunCount++
 	if taskID != "" {
-		log.Infof("[scheduler] Scheduled download triggered [%s]: target=%s name=%q task_id=%s", entry.Type, entry.Target, entry.Name, taskID)
-	} else {
-		log.Warnf("[scheduler] Scheduled download failed [%s]: target=%s name=%q (empty task_id)", entry.Type, entry.Target, entry.Name)
+		status.LastTaskID = taskID
+		status.LastError = ""
+		status.ConsecutiveFailures = 0
+		return
 	}
+	if runErr != nil {
+		status.LastError = runErr.Error()
+	} else {
+		status.LastError = "download function returned empty task_id"
+	}
+	status.ConsecutiveFailures++
 }
 
 func (sc *Scheduler) updateStatus(idx int, entry ScheduleEntry, update func(*ScheduleStatus)) bool {
@@ -645,7 +635,7 @@ func (sc *Scheduler) releaseTriggeringLocked(idx int, acquiredGen int64) {
 }
 
 func (sc *Scheduler) applyConfig(entries []ScheduleEntry, parsed []*ParsedSchedule, statuses []ScheduleStatus) {
-	log.Debugf("[scheduler] Reload: swapping %d entries into scheduler (generation++)", len(entries))
+	log.Debugf("[scheduler] Config swap entries=%d", len(entries))
 	sc.mu.Lock()
 	sc.entries = entries
 	sc.parsed = parsed
@@ -666,9 +656,47 @@ func (sc *Scheduler) statusChangeSnapshotLocked() (ScheduleStatusChangeFunc, boo
 		return nil, false, nil
 	}
 
-	statuses := make([]ScheduleStatus, len(sc.statuses))
-	copy(statuses, sc.statuses)
-	return callback, sc.started, statuses
+	return callback, sc.started, cloneStatuses(sc.statuses)
+}
+
+// cloneStatuses 深拷贝状态快照：LastRunAt/NextRunAt 指向的时间值与
+// Entry 里的 Users/Lists/FollowingNames 切片都不与调度器内部共享。
+// 调用方（HTTP 处理器、SSE、OnStatusChange 回调）拿到的是独立副本，
+// 修改快照不会污染调度器内部状态。
+func cloneStatuses(statuses []ScheduleStatus) []ScheduleStatus {
+	cloned := make([]ScheduleStatus, len(statuses))
+	for i, status := range statuses {
+		cloned[i] = cloneStatus(status)
+	}
+	return cloned
+}
+
+func cloneStatus(status ScheduleStatus) ScheduleStatus {
+	status.LastRunAt = cloneTimePtr(status.LastRunAt)
+	status.NextRunAt = cloneTimePtr(status.NextRunAt)
+	// 条目里的切片与调度器内部共享底层数组；快照必须独立，调用方改写
+	// 快照（例如 API 层复用请求体）才不会污染调度器状态。
+	status.Entry.Users = cloneStrings(status.Entry.Users)
+	status.Entry.Lists = cloneStrings(status.Entry.Lists)
+	status.Entry.FollowingNames = cloneStrings(status.Entry.FollowingNames)
+	return status
+}
+
+func cloneStrings(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	cloned := make([]string, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
+func cloneTimePtr(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func notifyStatusChange(callback ScheduleStatusChangeFunc, running bool, statuses []ScheduleStatus) {
@@ -684,14 +712,17 @@ func logReloadSummary(entries []ScheduleEntry) {
 			activeCount++
 		}
 	}
-	log.Infof("[scheduler] Config reloaded: %d schedules (%d active)", len(entries), activeCount)
+	log.Infof("[scheduler] Config reloaded total=%d active=%d", len(entries), activeCount)
 }
 
 func nextDailyTrigger(times []time.Time) time.Time {
+	return nextDailyTriggerAt(time.Now(), times)
+}
+
+func nextDailyTriggerAt(now time.Time, times []time.Time) time.Time {
 	if len(times) == 0 {
 		return time.Time{}
 	}
-	now := time.Now()
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 
 	for _, t := range times {
@@ -705,15 +736,6 @@ func nextDailyTrigger(times []time.Time) time.Time {
 	tomorrow := today.AddDate(0, 0, 1)
 	return time.Date(tomorrow.Year(), tomorrow.Month(), tomorrow.Day(), first.Hour(), first.Minute(), 0, 0, tomorrow.Location())
 }
-
-
-
-
-
-
-
-
-
 
 func ParseSchedule(raw string) (*ParsedSchedule, error) {
 	raw = strings.TrimSpace(raw)
@@ -738,12 +760,25 @@ func ParseSchedule(raw string) (*ParsedSchedule, error) {
 				return nil, fmt.Errorf("invalid daily time %q: %w", ts, err)
 			}
 			times = append(times, t)
-			if len(times) > maxDailyTimes {
-				return nil, fmt.Errorf("too many daily times: %d (maximum %d)", len(times), maxDailyTimes)
-			}
 		}
 		if len(times) == 0 {
 			return nil, fmt.Errorf("no daily times specified")
+		}
+		// 重复时间（例如 daily:07:00,07:00）只会在同一天触发一次，
+		// 保留首次出现的顺序并去掉重复项，避免展示与状态里出现两条相同时间。
+		unique := make([]time.Time, 0, len(times))
+		seen := make(map[int]struct{}, len(times))
+		for _, t := range times {
+			key := t.Hour()*60 + t.Minute()
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			unique = append(unique, t)
+		}
+		times = unique
+		if len(times) > maxDailyTimes {
+			return nil, fmt.Errorf("too many daily times: %d (maximum %d)", len(times), maxDailyTimes)
 		}
 		sorted := make([]time.Time, len(times))
 		copy(sorted, times)
@@ -753,31 +788,49 @@ func ParseSchedule(raw string) (*ParsedSchedule, error) {
 	return nil, fmt.Errorf("unknown schedule format: %q (use 'interval:2h' or 'daily:07:00,21:00')", raw)
 }
 
+// formatSeconds 渲染不足一分钟的剩余时长：整秒用整数，含亚秒时保留
+// 完整精度（例如 1m0.5s 显示「0.5 秒」而不是被丢掉）。
+func formatSeconds(d time.Duration) string {
+	if d%time.Second == 0 {
+		return fmt.Sprintf("%d 秒", int(d/time.Second))
+	}
+	return strconv.FormatFloat(float64(d)/float64(time.Second), 'f', -1, 64) + " 秒"
+}
+
 func FormatScheduleDisplay(parsed *ParsedSchedule, raw string) string {
+	if parsed == nil {
+		return raw
+	}
 	switch parsed.Mode {
 	case ScheduleModeInterval:
-		d := int(parsed.Interval.Hours()) / 24
-		h := int(parsed.Interval.Hours()) % 24
-		m := int(parsed.Interval.Minutes()) % 60
-		if d > 0 && h == 0 && m == 0 {
-			if d == 1 {
-				return "每 24 小时"
-			}
-			return fmt.Sprintf("每 %d 天", d)
+		interval := parsed.Interval
+		d := int(interval / (24 * time.Hour))
+		h := int(interval/time.Hour) % 24
+		m := int(interval/time.Minute) % 60
+		rest := interval - time.Duration(d)*24*time.Hour - time.Duration(h)*time.Hour - time.Duration(m)*time.Minute
+		if d == 1 && h == 0 && m == 0 && rest == 0 {
+			return "每 24 小时"
 		}
+		parts := make([]string, 0, 4)
 		if d > 0 {
-			parts := []string{fmt.Sprintf("%d 天", d)}
-			if h > 0 {
-				parts = append(parts, fmt.Sprintf("%d 小时", h))
+			if d == 1 && h == 0 && m == 0 {
+				parts = append(parts, "24 小时")
+			} else {
+				parts = append(parts, fmt.Sprintf("%d 天", d))
 			}
-			return "每 " + strings.Join(parts, " ")
 		}
-		if h > 0 && m > 0 {
-			return fmt.Sprintf("每 %d 小时 %d 分钟", h, m)
-		} else if h > 0 {
-			return fmt.Sprintf("每 %d 小时", h)
+		if h > 0 {
+			parts = append(parts, fmt.Sprintf("%d 小时", h))
 		}
-		return fmt.Sprintf("每 %d 分钟", m)
+		if m > 0 {
+			parts = append(parts, fmt.Sprintf("%d 分钟", m))
+		}
+		// 秒级间隔（例如 interval:90s）此前会被截断成「每 1 分钟」，
+		// 导致展示周期与实际触发周期不一致；不足一秒的部分同样保留。
+		if rest > 0 {
+			parts = append(parts, formatSeconds(rest))
+		}
+		return "每 " + strings.Join(parts, " ")
 	case ScheduleModeDaily:
 		parts := make([]string, len(parsed.Times))
 		for i, t := range parsed.Times {

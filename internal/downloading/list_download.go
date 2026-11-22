@@ -8,6 +8,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/unkmonster/tmd/internal/database"
 	"github.com/unkmonster/tmd/internal/entity"
+	"github.com/unkmonster/tmd/internal/logging"
 	"github.com/unkmonster/tmd/internal/naming"
 	"github.com/unkmonster/tmd/internal/twitter"
 	"github.com/unkmonster/tmd/internal/utils"
@@ -20,11 +21,16 @@ func syncList(db *sqlx.DB, list *twitter.List) error {
 	}
 	listdb, err := database.GetLst(db, list.Id)
 	if err != nil {
-		log.Errorf("[download] Failed to get list %d: %v", list.Id, err)
+		log.Debugf("[download] List load failed list_id=%d error=%q", list.Id, err.Error())
 		return err
 	}
 	if listdb == nil {
 		return database.CreateLst(db, &database.Lst{Id: list.Id, Name: list.Name, OwnerUserId: ownerUserId})
+	}
+	// 列表响应缺少 creator（API 省略 user_results 或解析失败）时不能用 0 覆盖
+	// 已知归属，否则 lsts.owner_user_id 被永久清零。
+	if list.Creator == nil && listdb.OwnerUserId != 0 {
+		ownerUserId = listdb.OwnerUserId
 	}
 	return database.UpdateLst(db, &database.Lst{Id: list.Id, Name: list.Name, OwnerUserId: ownerUserId})
 }
@@ -32,7 +38,7 @@ func syncList(db *sqlx.DB, list *twitter.List) error {
 func syncListAndGetMembers(ctx context.Context, client *resty.Client, db *sqlx.DB, lst twitter.ListBase, dir string, maxLen int, lsm *ListSyncManager) (entities []userInListEntity, members []*twitter.User, err error) {
 	if v, ok := lst.(*twitter.List); ok {
 		if err = syncList(db, v); err != nil {
-			log.Errorf("[download] Failed to sync list %s: %v", lst.Title(), err)
+			log.Debugf("[download] List sync failed list=%q error=%q", lst.Title(), err.Error())
 			return nil, nil, err
 		}
 	}
@@ -40,23 +46,25 @@ func syncListAndGetMembers(ctx context.Context, client *resty.Client, db *sqlx.D
 	expectedTitle := naming.NewListNamingFromBase(lst, maxLen).SanitizedTitle()
 	ent, err := entity.NewListEntity(db, lst.GetId(), dir)
 	if err != nil {
-		log.Errorf("[download] Failed to create list entity for %s: %v", lst.Title(), err)
+		log.Debugf("[download] List entity create failed list=%q dir=%q error=%q", lst.Title(), logging.Path(dir), err.Error())
 		return nil, nil, err
 	}
 	if err = entity.Sync(ent, expectedTitle); err != nil {
-		log.Errorf("[download] Failed to sync list entity for %s: %v", lst.Title(), err)
+		log.Debugf("[download] List entity sync failed list=%q expected_title=%q error=%q", lst.Title(), expectedTitle, err.Error())
 		return nil, nil, err
 	}
 
+	log.Debugf("[download] List members fetch start list=%q account=%s", lst.Title(), clientAccountForLog(client))
 	membersResult, err := lst.GetMembers(ctx, client)
 	if err != nil {
-		log.Errorf("[download] Failed to get members for list %s: %v", lst.Title(), err)
+		log.Debugf("[download] List members fetch failed list=%q account=%s error=%q", lst.Title(), clientAccountForLog(client), err.Error())
 		return nil, nil, err
 	}
+	log.Debugf("[download] List members fetch done list=%q account=%s members=%d", lst.Title(), clientAccountForLog(client), len(membersResult.Users))
 
 	eid, err := ent.Id()
 	if err != nil {
-		log.Errorf("[download] Failed to get entity id for list %s: %v", lst.Title(), err)
+		log.Debugf("[download] List entity id resolve failed list=%q error=%q", lst.Title(), err.Error())
 		return nil, nil, err
 	}
 
@@ -67,11 +75,11 @@ func syncListAndGetMembers(ctx context.Context, client *resty.Client, db *sqlx.D
 
 	memberIDs := utils.ExtractIDs(members, func(u *twitter.User) uint64 { return u.Id })
 	if err := database.MarkListMembersAccessibleByIDs(db, memberIDs); err != nil {
-		log.Warnf("[download] Failed to mark list members accessible for %s: %v", lst.Title(), err)
+		log.Warnf("[download] List members accessibility mark failed list=%q members=%d error=%q", lst.Title(), len(memberIDs), err.Error())
 	}
 	if lsm != nil {
 		if err = lsm.SyncListMembers(ctx, eid, lst.Title(), memberIDs); err != nil {
-		log.Warnf("[download] Failed to sync list members for %s: %v", lst.Title(), err)
+			log.Warnf("[download] List member links sync failed list=%q entity_id=%d members=%d error=%q", lst.Title(), eid, len(memberIDs), err.Error())
 		}
 	}
 

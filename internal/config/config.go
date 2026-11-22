@@ -13,20 +13,29 @@ import (
 	"strings"
 
 	log "github.com/sirupsen/logrus"
+	"github.com/unkmonster/tmd/internal/logging"
+	"github.com/unkmonster/tmd/internal/path"
 	"github.com/unkmonster/tmd/internal/utils"
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	MinFileNameLen       = 50
-	MaxFileNameLen       = 245
-	MaxDownloadRoutine    = 100
+	MinFileNameLen         = 50
+	MaxFileNameLen         = 245
+	MaxDownloadRoutine     = 100
+	MinUserFetchConcurrent = 1
+	MaxUserFetchConcurrent = 35
 )
 
 // DefaultMaxDownloadRoutine 返回默认的最大下载并发数
-// 基于 CPU 核心数计算，但不超过 100
+// 基于 CPU 核心数计算，但不超过 50
 func DefaultMaxDownloadRoutine() int {
-	return min(100, runtime.GOMAXPROCS(0)*10)
+	return min(50, runtime.GOMAXPROCS(0)*10)
+}
+
+// DefaultMaxUserFetchConcurrent 返回默认的 UserMedia 抓取并发数
+func DefaultMaxUserFetchConcurrent() int {
+	return 3
 }
 
 type Cookie struct {
@@ -35,20 +44,22 @@ type Cookie struct {
 }
 
 type Config struct {
-	RootPath           string      `yaml:"root_path"`
-	Cookie             Cookie      `yaml:"cookie"`
-	MaxDownloadRoutine int         `yaml:"max_download_routine"`
-	MaxFileNameLen     int         `yaml:"max_file_name_len"`
-	ProxyURL           string      `yaml:"proxy_url"`
-	APIKey             string      `yaml:"api_key"`
+	RootPath               string `yaml:"root_path"`
+	Cookie                 Cookie `yaml:"cookie"`
+	MaxDownloadRoutine     int    `yaml:"max_download_routine"`
+	MaxUserFetchConcurrent int    `yaml:"max_user_fetch_concurrent"`
+	MaxFileNameLen         int    `yaml:"max_file_name_len"`
+	ProxyURL               string `yaml:"proxy_url"`
+	APIKey                 string `yaml:"api_key"`
+	BindAddress            string `yaml:"bind_address"`
 }
 type BotConfig struct {
-	Telegram *TelegramBotConfig  `yaml:"telegram,omitempty"`
-	Discord  *DiscordBotConfig   `yaml:"discord,omitempty"`
-	Gotify   *GotifyBotConfig    `yaml:"gotify,omitempty"`
-	Pushover *PushoverBotConfig  `yaml:"pushover,omitempty"`
-	WeChat   *WeChatBotConfig    `yaml:"wechat,omitempty"`
-	Feishu   *FeishuBotConfig    `yaml:"feishu,omitempty"`
+	Telegram *TelegramBotConfig `yaml:"telegram,omitempty"`
+	Discord  *DiscordBotConfig  `yaml:"discord,omitempty"`
+	Gotify   *GotifyBotConfig   `yaml:"gotify,omitempty"`
+	Pushover *PushoverBotConfig `yaml:"pushover,omitempty"`
+	WeChat   *WeChatBotConfig   `yaml:"wechat,omitempty"`
+	Feishu   *FeishuBotConfig   `yaml:"feishu,omitempty"`
 }
 type TelegramBotConfig struct {
 	Token        string  `yaml:"token"`
@@ -159,6 +170,33 @@ func GetFieldDefs() []FieldDef {
 			},
 		},
 		{
+			Name:    "max_user_fetch_concurrent",
+			EnvName: "TMD_MAX_USER_FETCH_CONCURRENT",
+			Prompt:  "enter max user media fetch concurrent",
+			Default: strconv.Itoa(DefaultMaxUserFetchConcurrent()),
+			Getter: func(c *Config) string {
+				if c.MaxUserFetchConcurrent == 0 {
+					return strconv.Itoa(DefaultMaxUserFetchConcurrent())
+				}
+				return strconv.Itoa(c.MaxUserFetchConcurrent)
+			},
+			Setter: func(c *Config, v string) error {
+				n, err := parseIntWithDefault(v, DefaultMaxUserFetchConcurrent())
+				if err != nil {
+					return fmt.Errorf("invalid number: %w", err)
+				}
+				if n < 0 {
+					return fmt.Errorf("must not be negative")
+				}
+				if n > MaxUserFetchConcurrent {
+					return fmt.Errorf("must not exceed %d", MaxUserFetchConcurrent)
+				}
+				// 0 表示使用默认值，与 YAML 中 0=默认 的语义保持一致。
+				c.MaxUserFetchConcurrent = n
+				return nil
+			},
+		},
+		{
 			Name:    "max_file_name_len",
 			EnvName: "TMD_MAX_FILE_NAME_LEN",
 			Prompt:  fmt.Sprintf("enter max file name length (%d-%d)", MinFileNameLen, MaxFileNameLen),
@@ -199,14 +237,14 @@ func GetFieldDefs() []FieldDef {
 			Prompt:  "enter API key for HTTP auth (leave empty to disable)",
 			Default: "",
 			Getter:  func(c *Config) string { return c.APIKey },
-		Setter: func(c *Config, v string) error {
-			v = strings.TrimSpace(v)
-			if v != "" && len(v) < 8 {
-				return fmt.Errorf("api_key must be at least 8 characters when set")
-			}
-			c.APIKey = v
-			return nil
-		},
+			Setter: func(c *Config, v string) error {
+				v = strings.TrimSpace(v)
+				if v != "" && len(v) < 8 {
+					return fmt.Errorf("api_key must be at least 8 characters when set")
+				}
+				c.APIKey = v
+				return nil
+			},
 		},
 	}
 }
@@ -217,22 +255,34 @@ func normalizeProxyURL(raw string) (string, error) {
 		return "", nil
 	}
 	if !strings.Contains(raw, "://") {
-		return "", fmt.Errorf("invalid proxy URL %q: missing scheme or host", raw)
+		return "", fmt.Errorf("invalid proxy URL %q: missing scheme or host", proxyURLForError(raw))
 	}
 
 	parsed, err := url.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("invalid proxy URL %q: %w", raw, err)
+		return "", fmt.Errorf("invalid proxy URL %q: malformed URL", proxyURLForError(raw))
 	}
 	if parsed.Scheme == "" || parsed.Host == "" {
-		return "", fmt.Errorf("invalid proxy URL %q: missing scheme or host", raw)
+		return "", fmt.Errorf("invalid proxy URL %q: missing scheme or host", proxyURLForError(raw))
 	}
 	switch strings.ToLower(parsed.Scheme) {
-	case "http", "https", "socks5":
+	case "http", "https", "socks5", "socks5h":
 		return parsed.String(), nil
 	default:
-		return "", fmt.Errorf("invalid proxy URL %q: unsupported scheme %q", raw, parsed.Scheme)
+		return "", fmt.Errorf("invalid proxy URL %q: unsupported scheme %q", proxyURLForError(raw), parsed.Scheme)
 	}
+}
+
+func proxyURLForError(raw string) string {
+	if strings.Contains(raw, "@") {
+		candidate := raw
+		const placeholderScheme = "proxy://"
+		if !strings.Contains(candidate, "://") {
+			candidate = placeholderScheme + candidate
+		}
+		return strings.TrimPrefix(logging.SanitizeURL(candidate), placeholderScheme)
+	}
+	return logging.RedactSensitiveText(raw)
 }
 
 func normalizeRootPath(raw string) (string, error) {
@@ -240,11 +290,14 @@ func normalizeRootPath(raw string) (string, error) {
 	if raw == "" {
 		return "", fmt.Errorf("storage dir cannot be empty")
 	}
-	if err := os.MkdirAll(raw, 0755); err != nil {
+	// 归一化逻辑与 path 包共享（Clean + 绝对路径）。MkdirAll 在归一化后的
+	// 绝对路径上执行，避免相对 root 在 cwd 误建目录（path 包在 StorePath
+	// 构造时同样创建这些目录，此处为配置加载阶段的急切创建）。
+	absPath, err := path.NormalizeRoot(raw)
+	if err != nil {
 		return "", err
 	}
-	absPath, err := filepath.Abs(raw)
-	if err != nil {
+	if err := os.MkdirAll(absPath, 0755); err != nil {
 		return "", err
 	}
 	return absPath, nil
@@ -385,11 +438,13 @@ func NormalizeLoadedConf(conf *Config) error {
 	// 规范化 MaxDownloadRoutine：0 表示"使用默认值"；负数归零；超大值截断到上限
 	conf.MaxDownloadRoutine = normalizeInt(conf.MaxDownloadRoutine, 0, 0, MaxDownloadRoutine)
 
+	// 规范化 MaxUserFetchConcurrent：0 表示"使用默认值"；负数归零；低于下限或高于上限时截断
+	conf.MaxUserFetchConcurrent = normalizeInt(conf.MaxUserFetchConcurrent, 0, MinUserFetchConcurrent, MaxUserFetchConcurrent)
+
 	// 规范化 MaxFileNameLen：0 表示"使用默认值"；负数归零；低于下限或高于上限时截断
 	conf.MaxFileNameLen = normalizeInt(conf.MaxFileNameLen, 0, MinFileNameLen, MaxFileNameLen)
-
 	conf.APIKey = strings.TrimSpace(conf.APIKey)
-
+	conf.BindAddress = strings.TrimSpace(conf.BindAddress)
 
 	return nil
 }
@@ -503,11 +558,6 @@ func LoadBotConfig(path string) (*BotConfig, error) {
 		return nil, err
 	}
 	return conf, nil
-}
-
-// WriteBotConfig 将 Bot 配置写入 YAML 文件
-func WriteBotConfig(path string, conf *BotConfig) error {
-	return writeYAMLFile(path, conf)
 }
 
 func ReadAdditionalCookies(path string) ([]*Cookie, error) {

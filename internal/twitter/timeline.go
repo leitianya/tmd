@@ -98,11 +98,14 @@ func getResults(itemContent gjson.Result, itemType int) (gjson.Result, error) {
 
 func getTimelineResp(ctx context.Context, api timelineApi, client *resty.Client) ([]byte, error) {
 	url := makeUrl(api)
+	log.Debugf("[twitter] Timeline request endpoint=%s account=%s", endpointForLog(url), clientNameForLog(client))
 	resp, err := client.R().SetContext(ctx).Get(url)
 	if err != nil {
+		log.Debugf("[twitter] Timeline response error endpoint=%s account=%s error=%q", endpointForLog(url), clientNameForLog(client), errorForLog(err))
 		return nil, err
 	}
 	if err := CheckApiResp(resp.Body()); err != nil {
+		log.Debugf("[twitter] Timeline API error endpoint=%s account=%s error=%q", endpointForLog(url), clientNameForLog(client), errorForLog(err))
 		return nil, err
 	}
 	return resp.Body(), nil
@@ -136,7 +139,7 @@ func getTimelineItemContents(ctx context.Context, api timelineApi, client *resty
 			if entry.Get("content.entryType").String() != "TimelineTimelineCursor" {
 				contents, err := getItemContentsFromEntry(entry)
 				if err != nil {
-					log.Debugln("[twitter] GetItemContentsFromEntry failed:", err)
+					log.Debugf("[twitter] Timeline entry parse failed error=%q", errorForLog(err))
 					continue
 				}
 				itemContents = append(itemContents, contents...)
@@ -147,7 +150,7 @@ func getTimelineItemContents(ctx context.Context, api timelineApi, client *resty
 		for _, moduleItem := range moduleItems.Array() {
 			content, err := getItemContentFromModuleItem(moduleItem)
 			if err != nil {
-				log.Debugln("[twitter] GetItemContentFromModuleItem failed:", err)
+				log.Debugf("[twitter] Timeline module parse failed error=%q", errorForLog(err))
 				continue
 			}
 			itemContents = append(itemContents, content)

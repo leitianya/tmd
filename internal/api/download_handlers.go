@@ -11,15 +11,17 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/unkmonster/tmd/internal/database"
 	"github.com/unkmonster/tmd/internal/downloading"
+	"github.com/unkmonster/tmd/internal/logging"
 	"github.com/unkmonster/tmd/internal/path"
-	"github.com/unkmonster/tmd/internal/scheduler"
 	"github.com/unkmonster/tmd/internal/service"
 	"github.com/unkmonster/tmd/internal/utils"
 )
@@ -30,33 +32,79 @@ const (
 	maxUploadMemory      = 32 << 20
 )
 
-func (s *Server) enqueueTask(task *Task, run func(ctx context.Context, taskID string, reporter service.ProgressReporter) error) {
+// enqueueTask 入队任务。入队失败（队列已关闭/不可用）时把任务转为 Failed
+// 终态并返回错误，调用方不应再向客户端回复"已排队"成功。
+func (s *Server) enqueueTask(task *Task, run func(ctx context.Context, taskID string, reporter service.ProgressReporter) error) error {
 	if s.downloadQueue == nil {
-		s.taskManager.SetTaskError(task.ID, errors.New("download queue not available"))
-		return
+		err := errors.New("download queue not available")
+		s.taskManager.SetTaskError(task.ID, err)
+		return err
 	}
-	s.downloadQueue.Enqueue(task, run)
+	if err := s.downloadQueue.Enqueue(task, run); err != nil {
+		s.taskManager.SetTaskError(task.ID, err)
+		log.Warnf("[tasks] Enqueue rejected task_id=%s type=%s error=%q", task.ID, task.Type, err.Error())
+		return err
+	}
+	return nil
 }
 
-// buildAndEnqueueTask 构建 task 的运行函数并入队。构建失败时写入 500 响应并返回 false，
-// 调用方应在返回 false 时立即 return。统一 12 处下载处理器的"构建+入队"重复逻辑。
-// 注意：上传变体（需 cleanupUploadDirAfterTask 包装）和重试变体（不入队）不适用本方法。
+// buildAndEnqueueTask admits an existing HTTP task through the same mapper and
+// queue path used by bot, scheduler, and system tasks. It writes a 500/503
+// response on rejection, and callers must return immediately when it is false.
+// Upload variants still build the mapper result directly so they can wrap it
+// with temporary-upload cleanup.
 func (s *Server) buildAndEnqueueTask(w http.ResponseWriter, task *Task) bool {
-	runFunc, err := s.buildTaskRunFunc(task)
-	if err != nil {
-		log.Errorf("[tasks] Failed to build task run func: %v", err)
-		s.writeError(w, http.StatusInternalServerError, "Failed to create task")
+	if err := s.EnqueueTask(task); err != nil {
+		if errors.Is(err, ErrQueueClosed) {
+			s.writeError(w, http.StatusServiceUnavailable, "Task rejected during shutdown")
+		} else {
+			s.writeError(w, http.StatusInternalServerError, "Failed to create task")
+		}
 		return false
 	}
-	s.enqueueTask(task, runFunc)
 	return true
+}
+
+// EnqueueTask builds and queues a task created outside HTTP handlers, such as
+// bot commands. It keeps those entrypoints on the same execution path as the API.
+func (s *Server) EnqueueTask(task *Task) error {
+	if task == nil {
+		return errors.New("task is nil")
+	}
+	if s.downloadQueue == nil {
+		err := errors.New("download queue not available")
+		s.taskManager.SetTaskError(task.ID, err)
+		return err
+	}
+	runFunc, err := s.buildTaskRunFunc(task)
+	if err != nil {
+		s.taskManager.SetTaskError(task.ID, err)
+		log.Errorf("[tasks] Run function build failed task_id=%s type=%s error=%q", task.ID, task.Type, err.Error())
+		return err
+	}
+	return s.enqueueTask(task, runFunc)
+}
+
+// createAndEnqueueTask is the canonical admission path for producers that do
+// not need to customize the task runner. It captures the initial status before
+// the queue worker can advance the task, preserving the HTTP 202 contract.
+func (s *Server) createAndEnqueueTask(taskType TaskType, data interface{}, options TaskCreateOptions) (string, TaskStatus, error) {
+	task := s.taskManager.CreateTaskWithOptions(taskType, data, options)
+	taskID := task.ID
+	status := task.Status
+	if err := s.EnqueueTask(task); err != nil {
+		return taskID, status, err
+	}
+	return taskID, status, nil
 }
 
 func formatTaskMarkTime(timestamp *time.Time) *string {
 	if timestamp == nil {
 		return nil
 	}
-	formatted := timestamp.Format("2006-01-02T15:04:05")
+	// RFC3339 携带时区偏移（JSON 解析出的 Z 输入保持 UTC），避免下游把
+	// UTC 墙钟按服务器本地时区二次解释导致标记时间偏移。
+	formatted := timestamp.Format(time.RFC3339)
 	return &formatted
 }
 
@@ -114,7 +162,7 @@ func (s *Server) handleFollowingMarkRoute(w http.ResponseWriter, r *http.Request
 func (s *Server) handleUserDownload(w http.ResponseWriter, r *http.Request, screenName string) {
 	var req UserDownloadTaskData
 	if err := decodeOptionalJSON(r, &req); err != nil {
-		log.Debugf("[download] Invalid request body: %v", err)
+		log.Debugf("[download] Invalid request body route=user_download error=%q", err.Error())
 		s.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
@@ -162,7 +210,7 @@ func (s *Server) handleUserProfile(w http.ResponseWriter, _ *http.Request, scree
 func (s *Server) handleUserMark(w http.ResponseWriter, r *http.Request, screenName string) {
 	var req MarkDownloadedTaskData
 	if err := decodeOptionalJSON(r, &req); err != nil {
-		log.Debugf("[download] Invalid request body: %v", err)
+		log.Debugf("[download] Invalid request body route=user_mark error=%q", err.Error())
 		s.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
@@ -188,7 +236,7 @@ func (s *Server) handleUserMark(w http.ResponseWriter, r *http.Request, screenNa
 func (s *Server) handleListMark(w http.ResponseWriter, r *http.Request, listID uint64) {
 	var req ListMarkDownloadedTaskData
 	if err := decodeOptionalJSON(r, &req); err != nil {
-		log.Debugf("[download] Invalid request body: %v", err)
+		log.Debugf("[download] Invalid request body route=list_mark error=%q", err.Error())
 		s.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
@@ -214,7 +262,7 @@ func (s *Server) handleListMark(w http.ResponseWriter, r *http.Request, listID u
 func (s *Server) handleFollowingMark(w http.ResponseWriter, r *http.Request, screenName string) {
 	var req FollowingMarkDownloadedTaskData
 	if err := decodeOptionalJSON(r, &req); err != nil {
-		log.Debugf("[download] Invalid request body: %v", err)
+		log.Debugf("[download] Invalid request body route=following_mark error=%q", err.Error())
 		s.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
@@ -240,7 +288,7 @@ func (s *Server) handleFollowingMark(w http.ResponseWriter, r *http.Request, scr
 func (s *Server) handleFollowingDownload(w http.ResponseWriter, r *http.Request, screenName string) {
 	var req FollowingDownloadTaskData
 	if err := decodeOptionalJSON(r, &req); err != nil {
-		log.Debugf("[download] Invalid request body: %v", err)
+		log.Debugf("[download] Invalid request body route=following_download error=%q", err.Error())
 		s.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
@@ -269,7 +317,7 @@ func (s *Server) handleFollowingDownload(w http.ResponseWriter, r *http.Request,
 func (s *Server) listIDFromPath(w http.ResponseWriter, r *http.Request) (uint64, bool) {
 	listID, err := strconv.ParseUint(r.PathValue("list_id"), 10, 64)
 	if err != nil {
-		log.Debugf("[download] Invalid list ID: %v", err)
+		log.Debugf("[download] Invalid list ID value=%q error=%q", r.PathValue("list_id"), err.Error())
 		s.writeError(w, http.StatusBadRequest, "Invalid list ID")
 		return 0, false
 	}
@@ -310,7 +358,7 @@ func (s *Server) handleListMarkRoute(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListDownload(w http.ResponseWriter, r *http.Request, listID uint64) {
 	var req ListDownloadTaskData
 	if err := decodeOptionalJSON(r, &req); err != nil {
-		log.Debugf("[download] Invalid request body: %v", err)
+		log.Debugf("[download] Invalid request body route=list_download error=%q", err.Error())
 		s.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
@@ -362,12 +410,15 @@ func (s *Server) handleJsonFileDownload(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var req JsonFileDownloadTaskData
+	s.limitJSONBody(w, r, defaultJSONBodyLimit)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Debugf("[download] Invalid request body: %v", err)
+		if s.writeBodyTooLarge(w, err) {
+			return
+		}
+		log.Debugf("[download] Invalid request body route=json_file_download error=%q", err.Error())
 		s.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
-
 	if len(req.Paths) == 0 {
 		s.writeError(w, http.StatusBadRequest, "Paths are required")
 		return
@@ -396,12 +447,15 @@ func (s *Server) handleJsonFolderDownload(w http.ResponseWriter, r *http.Request
 	}
 
 	var req JsonFolderDownloadTaskData
+	s.limitJSONBody(w, r, defaultJSONBodyLimit)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Debugf("[download] Invalid request body: %v", err)
+		if s.writeBodyTooLarge(w, err) {
+			return
+		}
+		log.Debugf("[download] Invalid request body route=json_folder_download error=%q", err.Error())
 		s.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
-
 	if len(req.Paths) == 0 {
 		s.writeError(w, http.StatusBadRequest, "Paths are required")
 		return
@@ -431,7 +485,7 @@ func (s *Server) handleJsonFileUpload(w http.ResponseWriter, r *http.Request) {
 		if uploadDir != "" {
 			_ = os.RemoveAll(uploadDir)
 		}
-		log.Errorf("[upload] Failed to save JSON files: %v", err)
+		log.Errorf("[upload] Save failed kind=json upload_dir=%q error=%q", logging.Path(uploadDir), err.Error())
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
 			s.writeError(w, http.StatusRequestEntityTooLarge, "Upload too large")
@@ -457,11 +511,21 @@ func (s *Server) handleJsonFileUpload(w http.ResponseWriter, r *http.Request) {
 	runFunc, err := s.buildTaskRunFunc(task)
 	if err != nil {
 		_ = os.RemoveAll(uploadDir)
-		log.Errorf("[tasks] Failed to build task run func: %v", err)
+		s.taskManager.SetTaskError(task.ID, err)
+		log.Errorf("[tasks] Run function build failed task_id=%s type=%s error=%q", task.ID, task.Type, err.Error())
 		s.writeError(w, http.StatusInternalServerError, "Failed to create task")
 		return
 	}
-	s.enqueueTask(task, cleanupUploadDirAfterTask(uploadDir, runFunc))
+	if err := s.enqueueTask(task, cleanupUploadDirAfterTask(uploadDir, runFunc)); err != nil {
+		// 入队被拒（关停窗口）：清理上传目录，回复 503，不给假成功。
+		_ = os.RemoveAll(uploadDir)
+		status := http.StatusServiceUnavailable
+		if !errors.Is(err, ErrQueueClosed) {
+			status = http.StatusInternalServerError
+		}
+		s.writeError(w, status, "Upload rejected during shutdown")
+		return
+	}
 
 	s.writeJSON(w, http.StatusAccepted, NewSuccessResponse(map[string]interface{}{
 		"message":    "JSON file upload task queued",
@@ -480,7 +544,7 @@ func (s *Server) handleJsonFolderUpload(w http.ResponseWriter, r *http.Request) 
 		if uploadDir != "" {
 			_ = os.RemoveAll(uploadDir)
 		}
-		log.Errorf("[upload] Failed to save loongtweet files: %v", err)
+		log.Errorf("[upload] Save failed kind=loongtweet upload_dir=%q error=%q", logging.Path(uploadDir), err.Error())
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
 			s.writeError(w, http.StatusRequestEntityTooLarge, "Upload too large")
@@ -506,11 +570,21 @@ func (s *Server) handleJsonFolderUpload(w http.ResponseWriter, r *http.Request) 
 	runFunc, err := s.buildTaskRunFunc(task)
 	if err != nil {
 		_ = os.RemoveAll(uploadDir)
-		log.Errorf("[tasks] Failed to build task run func: %v", err)
+		s.taskManager.SetTaskError(task.ID, err)
+		log.Errorf("[tasks] Run function build failed task_id=%s type=%s error=%q", task.ID, task.Type, err.Error())
 		s.writeError(w, http.StatusInternalServerError, "Failed to create task")
 		return
 	}
-	s.enqueueTask(task, cleanupUploadDirAfterTask(uploadDir, runFunc))
+	if err := s.enqueueTask(task, cleanupUploadDirAfterTask(uploadDir, runFunc)); err != nil {
+		// 入队被拒（关停窗口）：清理上传目录，回复 503，不给假成功。
+		_ = os.RemoveAll(uploadDir)
+		status := http.StatusServiceUnavailable
+		if !errors.Is(err, ErrQueueClosed) {
+			status = http.StatusInternalServerError
+		}
+		s.writeError(w, status, "Upload rejected during shutdown")
+		return
+	}
 
 	s.writeJSON(w, http.StatusAccepted, NewSuccessResponse(map[string]interface{}{
 		"message":    "LoongTweet upload task queued",
@@ -539,7 +613,7 @@ func cleanupUploadDirAfterTask(uploadDir string, task func(ctx context.Context, 
 		defer func() {
 			_ = os.RemoveAll(uploadDir)
 			if r := recover(); r != nil {
-				log.Errorf("[upload] task panicked: %v", r)
+				log.Errorf("[upload] Task panic upload_dir=%q error=%q", logging.Path(uploadDir), fmt.Sprint(r))
 				err = fmt.Errorf("task panicked: %v", r)
 			}
 		}()
@@ -705,12 +779,15 @@ func parseScheduledListIDs(values []string) ([]StringUint64, error) {
 
 func (s *Server) handleBatchDownload(w http.ResponseWriter, r *http.Request) {
 	var req BatchDownloadTaskData
+	s.limitJSONBody(w, r, rawContentBodyLimit)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Debugf("[download] Invalid request body: %v", err)
+		if s.writeBodyTooLarge(w, err) {
+			return
+		}
+		log.Debugf("[download] Invalid request body route=batch_download error=%q", err.Error())
 		s.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
-
 	if len(req.Users) == 0 && len(req.Lists) == 0 && len(req.FollowingNames) == 0 {
 		s.writeError(w, http.StatusBadRequest, "At least one of users, lists, or following_names is required")
 		return
@@ -718,25 +795,24 @@ func (s *Server) handleBatchDownload(w http.ResponseWriter, r *http.Request) {
 
 	users, err := normalizeBatchScreenNames(req.Users)
 	if err != nil {
-		log.Debugf("[download] Invalid screen names: %v", err)
+		log.Debugf("[download] Invalid batch targets route=batch_download field=users error=%q", err.Error())
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	followingNames, err := normalizeBatchScreenNames(req.FollowingNames)
 	if err != nil {
-		log.Debugf("[download] Invalid following names: %v", err)
+		log.Debugf("[download] Invalid batch targets route=batch_download field=following_names error=%q", err.Error())
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	_, err = validateBatchListIDs(req.Lists)
 	if err != nil {
-		log.Debugf("[download] Invalid list IDs: %v", err)
+		log.Debugf("[download] Invalid batch targets route=batch_download field=lists error=%q", err.Error())
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	req.Users = users
 	req.FollowingNames = followingNames
-
 
 	task := s.taskManager.CreateTask(TaskTypeBatchDownload, &req)
 	taskID := task.ID
@@ -765,8 +841,12 @@ func (s *Server) handleBatchDownload(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleBatchMark(w http.ResponseWriter, r *http.Request) {
 	var req BatchMarkDownloadedTaskData
+	s.limitJSONBody(w, r, defaultJSONBodyLimit)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Debugf("[download] Invalid request body: %v", err)
+		if s.writeBodyTooLarge(w, err) {
+			return
+		}
+		log.Debugf("[download] Invalid request body route=batch_mark error=%q", err.Error())
 		s.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
@@ -778,25 +858,24 @@ func (s *Server) handleBatchMark(w http.ResponseWriter, r *http.Request) {
 
 	users, err := normalizeBatchScreenNames(req.Users)
 	if err != nil {
-		log.Debugf("[download] Invalid screen names: %v", err)
+		log.Debugf("[download] Invalid batch targets route=batch_mark field=users error=%q", err.Error())
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	followingNames, err := normalizeBatchScreenNames(req.FollowingNames)
 	if err != nil {
-		log.Debugf("[download] Invalid following names: %v", err)
+		log.Debugf("[download] Invalid batch targets route=batch_mark field=following_names error=%q", err.Error())
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	_, err = validateBatchListIDs(req.Lists)
 	if err != nil {
-		log.Debugf("[download] Invalid list IDs: %v", err)
+		log.Debugf("[download] Invalid batch targets route=batch_mark field=lists error=%q", err.Error())
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	req.Users = users
 	req.FollowingNames = followingNames
-
 
 	task := s.taskManager.CreateTask(TaskTypeMarkDownloaded, &req)
 	taskID := task.ID
@@ -890,49 +969,37 @@ func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRetryTask(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("task_id")
 
-	// 先获取原任务快照用于重建 run 函数
-	original, ok := s.taskManager.GetTask(taskID)
-	if !ok {
+	newTaskID, code := s.retryTask(taskID)
+	if code != "" {
+		s.writeRetryTaskError(w, code)
+		return
+	}
+
+	status := TaskStatusQueued
+	if task, ok := s.taskManager.GetTask(newTaskID); ok {
+		status = task.Status
+	}
+	s.writeJSON(w, http.StatusAccepted, NewSuccessResponse(map[string]interface{}{
+		"message":     "Task retried",
+		"task_id":     newTaskID,
+		"status":      status,
+		"original_id": taskID,
+	}))
+}
+
+// writeRetryTaskError 把 retryTask 的失败码映射为 HTTP 状态与错误文案。
+func (s *Server) writeRetryTaskError(w http.ResponseWriter, code string) {
+	switch code {
+	case "not_found":
 		s.writeError(w, http.StatusNotFound, "Task not found")
-		return
-	}
-
-	if original.Status != TaskStatusFailed && original.Status != TaskStatusCancelled {
+	case "not_retryable":
 		s.writeError(w, http.StatusConflict, "Task cannot be retried (not in failed or cancelled status)")
-		return
-	}
-
-	// 上传类任务（JsonFile/JsonFolder）的临时文件在任务结束后会被清理，不可重试
-	if d, ok := original.Data.(*JsonFileDownloadTaskData); ok && d.FromUpload {
-		s.writeError(w, http.StatusConflict, "Uploaded JSON task cannot be retried (uploaded files are no longer available)")
-		return
-	}
-	if d, ok := original.Data.(*JsonFolderDownloadTaskData); ok && d.FromUpload {
-		s.writeError(w, http.StatusConflict, "Uploaded LoongTweet task cannot be retried (uploaded files are no longer available)")
-		return
-	}
-
-	runFunc, err := s.buildTaskRunFunc(original)
-	if err != nil {
-		log.Errorf("[tasks] Failed to build task run func: %v", err)
+	case "not_retryable_upload":
+		s.writeError(w, http.StatusConflict, "Uploaded task cannot be retried (uploaded files are no longer available)")
+	case "invalid_task":
 		s.writeError(w, http.StatusBadRequest, "Invalid task type")
-		return
-	}
-
-	newTask, result := s.taskManager.RetryTask(taskID)
-	switch result {
-	case RetryTaskResultSuccess:
-		s.enqueueTask(newTask, runFunc)
-		s.writeJSON(w, http.StatusAccepted, NewSuccessResponse(map[string]interface{}{
-			"message":     "Task retried",
-			"task_id":     newTask.ID,
-			"status":      newTask.Status,
-			"original_id": taskID,
-		}))
-	case RetryTaskResultNotFound:
-		s.writeError(w, http.StatusNotFound, "Task not found")
-	case RetryTaskResultNotRetryable:
-		s.writeError(w, http.StatusConflict, "Task cannot be retried (not in failed or cancelled status)")
+	case "queue_closed":
+		s.writeError(w, http.StatusServiceUnavailable, "Task rejected during shutdown")
 	default:
 		s.writeError(w, http.StatusInternalServerError, "Failed to retry task")
 	}
@@ -942,18 +1009,17 @@ func (s *Server) handleRetryTask(w http.ResponseWriter, r *http.Request) {
 // buildTaskRunFunc 根据 Task 的类型和数据构建对应的下载执行函数。
 // 所有创建任务的 handler 和重试逻辑共用此方法，确保 DownloadOptions 和服务调用逻辑唯一。
 func (s *Server) buildTaskRunFunc(task *Task) (func(ctx context.Context, taskID string, reporter service.ProgressReporter) error, error) {
+	if task == nil {
+		return nil, errors.New("task is nil")
+	}
+
 	switch task.Type {
 	case TaskTypeUserDownload:
 		data, ok := task.Data.(*UserDownloadTaskData)
 		if !ok || data == nil {
 			return nil, fmt.Errorf("invalid task data for user_download")
 		}
-		opts := service.DownloadOptions{
-			AutoFollow:    data.AutoFollow,
-			FollowMembers: data.FollowMembers,
-			SkipProfile:   data.SkipProfile,
-			NoRetry:       data.NoRetry,
-		}
+		opts := data.downloadOptions()
 		return func(ctx context.Context, taskID string, reporter service.ProgressReporter) error {
 			return s.downloadService.UserDownload(ctx, taskID, data.ScreenName, opts, reporter)
 		}, nil
@@ -964,12 +1030,7 @@ func (s *Server) buildTaskRunFunc(task *Task) (func(ctx context.Context, taskID 
 			return nil, fmt.Errorf("invalid task data for list_download")
 		}
 		listID := uint64(data.ListID)
-		opts := service.DownloadOptions{
-			AutoFollow:    data.AutoFollow,
-			FollowMembers: data.FollowMembers,
-			SkipProfile:   data.SkipProfile,
-			NoRetry:       data.NoRetry,
-		}
+		opts := data.downloadOptions()
 		return func(ctx context.Context, taskID string, reporter service.ProgressReporter) error {
 			return s.downloadService.ListDownload(ctx, taskID, listID, opts, reporter)
 		}, nil
@@ -979,12 +1040,7 @@ func (s *Server) buildTaskRunFunc(task *Task) (func(ctx context.Context, taskID 
 		if !ok || data == nil {
 			return nil, fmt.Errorf("invalid task data for following_download")
 		}
-		opts := service.DownloadOptions{
-			AutoFollow:    data.AutoFollow,
-			FollowMembers: data.FollowMembers,
-			SkipProfile:   data.SkipProfile,
-			NoRetry:       data.NoRetry,
-		}
+		opts := data.downloadOptions()
 		return func(ctx context.Context, taskID string, reporter service.ProgressReporter) error {
 			return s.downloadService.FollowingDownload(ctx, taskID, data.ScreenName, opts, reporter)
 		}, nil
@@ -1042,12 +1098,7 @@ func (s *Server) buildTaskRunFunc(task *Task) (func(ctx context.Context, taskID 
 			return nil, fmt.Errorf("invalid task data for batch_download")
 		}
 		listIDs := stringUint64SliceToUint64(data.Lists)
-		opts := service.DownloadOptions{
-			AutoFollow:    data.AutoFollow,
-			FollowMembers: data.FollowMembers,
-			SkipProfile:   data.SkipProfile,
-			NoRetry:       data.NoRetry,
-		}
+		opts := data.downloadOptions()
 		return func(ctx context.Context, taskID string, reporter service.ProgressReporter) error {
 			return s.downloadService.BatchDownload(ctx, taskID, data.Users, listIDs, data.FollowingNames, opts, reporter)
 		}, nil
@@ -1070,30 +1121,42 @@ func (s *Server) buildTaskRunFunc(task *Task) (func(ctx context.Context, taskID 
 			return s.downloadService.JsonFolderDownload(ctx, taskID, data.Paths, data.NoRetry, reporter)
 		}, nil
 
+	case TaskTypeRetryAllFailed:
+		// This is the sole payload-free system task. It still uses the same
+		// mapper and queue admission path as every download task.
+		if task.Data != nil {
+			return nil, fmt.Errorf("invalid task data for retry_all_failed")
+		}
+		return func(ctx context.Context, taskID string, reporter service.ProgressReporter) error {
+			return s.downloadService.RetryAllFailed(ctx, taskID, reporter)
+		}, nil
+
 	default:
-		return nil, fmt.Errorf("unsupported task type for retry: %s", task.Type)
+		return nil, fmt.Errorf("unsupported task type: %s", task.Type)
 	}
 }
 
 func (s *Server) handleRetryAllFailed(w http.ResponseWriter, r *http.Request) {
-	// 作为任务创建并入队，与批量下载模式一致
-	task := s.taskManager.CreateTask(TaskTypeRetryAllFailed, nil)
-	taskID := task.ID
-
-	s.enqueueTask(task, func(ctx context.Context, taskID string, reporter service.ProgressReporter) error {
-		return s.downloadService.RetryAllFailed(ctx, taskID, reporter)
-	})
+	taskID, status, err := s.createAndEnqueueTask(TaskTypeRetryAllFailed, nil, TaskCreateOptions{})
+	if err != nil {
+		if errors.Is(err, ErrQueueClosed) {
+			s.writeError(w, http.StatusServiceUnavailable, "Task rejected during shutdown")
+		} else {
+			s.writeError(w, http.StatusInternalServerError, "Failed to create task")
+		}
+		return
+	}
 
 	s.writeJSON(w, http.StatusAccepted, NewSuccessResponse(map[string]interface{}{
 		"message": "Retry all failed tweets task queued",
 		"task_id": taskID,
-		"status":  task.Status,
+		"status":  status,
 	}))
 }
 
 func (s *Server) handleClearErrors(w http.ResponseWriter, r *http.Request) {
 	if err := s.downloadService.ClearErrors(); err != nil {
-		log.Errorf("[download] Failed to clear errors: %v", err)
+		log.Errorf("[download] Error records clear failed error=%q", err.Error())
 		s.writeError(w, http.StatusInternalServerError, "Failed to clear errors")
 		return
 	}
@@ -1115,6 +1178,7 @@ func (s *Server) handleErrors(w http.ResponseWriter, r *http.Request) {
 	regDumper := downloading.NewDumper()
 	_ = regDumper.Load(storePath.ErrorsPath)
 	resp.Regular = regDumper.Summary()
+	resp.RegularDetails = s.errorEntityDetails(resp.Regular)
 
 	// JSON 文件下载错误
 	jsonDumper := downloading.NewJsonDumper()
@@ -1124,126 +1188,109 @@ func (s *Server) handleErrors(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, NewSuccessResponse(resp))
 }
 
-func (s *Server) scheduledDownload(entry scheduler.ScheduleEntry) string {
-	opts := service.DownloadOptions{
-		AutoFollow:    entry.AutoFollow,
-		FollowMembers: entry.FollowMembers,
-		SkipProfile:   entry.SkipProfile,
-		NoRetry:       entry.NoRetry,
+// errorEntityDetails 把失败计数映射成带实体名的明细。一次批量查询 user_entities
+// 与 lst_entities，再批量取用户账号；查不到的实体保留 ID 和计数，界面仍能显示裸 ID。
+// 失败记录的键是实体 ID，user_entities 与 lst_entities 的 ID 取自同一自增区间，
+// 因此先命中 user_entities，未命中再按 lst_entities 处理。
+func (s *Server) errorEntityDetails(regular map[int]int) []ErrorEntityDetail {
+	if len(regular) == 0 {
+		return nil
+	}
+	ids := make([]int, 0, len(regular))
+	for id := range regular {
+		ids = append(ids, id)
 	}
 
-	switch entry.Type {
-	case scheduler.ScheduleTypeList:
-		listID, err := strconv.ParseUint(entry.Target, 10, 64)
-		if err != nil {
-			log.Warnf("[scheduler] Invalid list_id %q: %v", entry.Target, err)
-			return ""
+	var userEntities map[int]*database.UserEntity
+	var lstEntities map[int]*database.LstEntity
+	if s.db != nil {
+		if found, err := database.GetUserEntitiesByIDs(s.db, ids); err == nil {
+			userEntities = found
+		} else {
+			log.Debugf("[errors] Batch user entity lookup failed error=%q", err.Error())
 		}
-		if listID == 0 {
-			log.Warnf("[scheduler] Invalid list_id %q: must be a positive integer", entry.Target)
-			return ""
+		if len(userEntities) < len(ids) {
+			missing := make([]int, 0, len(ids)-len(userEntities))
+			for _, id := range ids {
+				if _, ok := userEntities[id]; !ok {
+					missing = append(missing, id)
+				}
+			}
+			if found, err := database.GetLstEntitiesByIDs(s.db, missing); err == nil {
+				lstEntities = found
+			} else {
+				log.Debugf("[errors] Batch list entity lookup failed error=%q", err.Error())
+			}
 		}
-		req := &ListDownloadTaskData{
-			ListID:        StringUint64(listID),
-			AutoFollow:    entry.AutoFollow,
-			FollowMembers: entry.FollowMembers,
-			SkipProfile:   entry.SkipProfile,
-			NoRetry:       entry.NoRetry,
-		}
-		task := s.taskManager.CreateTask(TaskTypeListDownload, req)
-		task.EntryID = entry.ID
-		s.enqueueTask(task, func(ctx context.Context, taskID string, reporter service.ProgressReporter) error {
-			return s.downloadService.ListDownload(ctx, taskID, listID, opts, reporter)
-		})
-		return task.ID
-
-	case scheduler.ScheduleTypeUser:
-		screenName := utils.NormalizeScreenName(strings.TrimSpace(entry.Target))
-		if !utils.IsValidScreenName(screenName) {
-			log.Warnf("[scheduler] Invalid user screen_name %q", entry.Target)
-			return ""
-		}
-		req := &UserDownloadTaskData{
-			ScreenName:    screenName,
-			AutoFollow:    entry.AutoFollow,
-			FollowMembers: entry.FollowMembers,
-			SkipProfile:   entry.SkipProfile,
-			NoRetry:       entry.NoRetry,
-		}
-		task := s.taskManager.CreateTask(TaskTypeUserDownload, req)
-		task.EntryID = entry.ID
-		s.enqueueTask(task, func(ctx context.Context, taskID string, reporter service.ProgressReporter) error {
-			return s.downloadService.UserDownload(ctx, taskID, screenName, opts, reporter)
-		})
-		return task.ID
-
-	case scheduler.ScheduleTypeFollowing:
-		screenName := utils.NormalizeScreenName(strings.TrimSpace(entry.Target))
-		if !utils.IsValidScreenName(screenName) {
-			log.Warnf("[scheduler] Invalid following screen_name %q", entry.Target)
-			return ""
-		}
-		req := &FollowingDownloadTaskData{
-			ScreenName:    screenName,
-			AutoFollow:    entry.AutoFollow,
-			FollowMembers: entry.FollowMembers,
-			SkipProfile:   entry.SkipProfile,
-			NoRetry:       entry.NoRetry,
-		}
-		task := s.taskManager.CreateTask(TaskTypeFollowingDownload, req)
-		task.EntryID = entry.ID
-		s.enqueueTask(task, func(ctx context.Context, taskID string, reporter service.ProgressReporter) error {
-			return s.downloadService.FollowingDownload(ctx, taskID, screenName, opts, reporter)
-		})
-		return task.ID
-
-	case scheduler.ScheduleTypeMixed:
-		lists, err := parseScheduledListIDs(entry.Lists)
-		if err != nil {
-			log.Warnf("[scheduler] Invalid mixed schedule %q: %v", entry.Name, err)
-			return ""
-		}
-		users, err := normalizeBatchScreenNames(entry.Users)
-		if err != nil {
-			log.Warnf("[scheduler] Invalid mixed schedule %q: %v", entry.Name, err)
-			return ""
-		}
-		followingNames, err := normalizeBatchScreenNames(entry.FollowingNames)
-		if err != nil {
-			log.Warnf("[scheduler] Invalid mixed schedule %q: %v", entry.Name, err)
-			return ""
-		}
-		listIDs, err := validateBatchListIDs(lists)
-		if err != nil {
-			log.Warnf("[scheduler] Invalid mixed schedule %q: %v", entry.Name, err)
-			return ""
-		}
-		if len(users) == 0 && len(lists) == 0 && len(followingNames) == 0 {
-			log.Warnf("[scheduler] Mixed schedule %q has no targets", entry.Name)
-			return ""
-		}
-
-		req := &BatchDownloadTaskData{
-			Users:          users,
-			Lists:          lists,
-			FollowingNames: followingNames,
-			AutoFollow:     entry.AutoFollow,
-			FollowMembers:  entry.FollowMembers,
-			SkipProfile:    entry.SkipProfile,
-			NoRetry:        entry.NoRetry,
-		}
-		task := s.taskManager.CreateTask(TaskTypeBatchDownload, req)
-		task.EntryID = entry.ID
-		s.enqueueTask(task, func(ctx context.Context, taskID string, reporter service.ProgressReporter) error {
-			return s.downloadService.BatchDownload(ctx, taskID, req.Users, listIDs, req.FollowingNames, opts, reporter)
-		})
-		return task.ID
-
-	default:
-		log.Warnf("[scheduler] Unknown schedule type: %q", entry.Type)
 	}
 
-	return ""
+	details := make([]ErrorEntityDetail, 0, len(ids))
+	ownerIDs := make([]uint64, 0, len(userEntities))
+	for id, failed := range regular {
+		detail := ErrorEntityDetail{EntityID: id, Failed: failed}
+		if ue, ok := userEntities[id]; ok && ue != nil {
+			detail.Kind = "user"
+			detail.Name = ue.Name
+			detail.UserID = ue.UserId
+			ownerIDs = append(ownerIDs, ue.UserId)
+		} else if le, ok := lstEntities[id]; ok && le != nil {
+			// 列表实体只带自己名字，归属信息来自 lsts 表。
+			detail.Kind = "list"
+			detail.Name = le.Name
+		}
+		details = append(details, detail)
+	}
+
+	if s.db != nil && len(ownerIDs) > 0 {
+		owners, err := database.GetUsersByIds(s.db, ownerIDs)
+		if err != nil {
+			log.Debugf("[errors] Batch user lookup failed error=%q", err.Error())
+		}
+		for i := range details {
+			if details[i].UserID == 0 {
+				continue
+			}
+			if usr, ok := owners[details[i].UserID]; ok && usr != nil {
+				details[i].ScreenName = usr.ScreenName
+			}
+		}
+	}
+	if s.db != nil && len(lstEntities) > 0 {
+		listIDs := make([]uint64, 0, len(lstEntities))
+		for _, le := range lstEntities {
+			if le != nil {
+				listIDs = append(listIDs, uint64(le.LstId))
+			}
+		}
+		lists := s.batchLoadNames("lsts", "id", "name", uint64Args(listIDs))
+		for i := range details {
+			if details[i].Kind != "list" {
+				continue
+			}
+			if le, ok := lstEntities[details[i].EntityID]; ok && le != nil {
+				if name, ok := lists[le.LstId]; ok && name != "" {
+					details[i].ScreenName = name
+				}
+			}
+		}
+	}
+
+	sort.Slice(details, func(i, j int) bool {
+		if details[i].Failed != details[j].Failed {
+			return details[i].Failed > details[j].Failed
+		}
+		return details[i].EntityID < details[j].EntityID
+	})
+	return details
+}
+
+// uint64Args 把 []uint64 转成 batchLoadNames 需要的 []interface{}。
+func uint64Args(values []uint64) []interface{} {
+	args := make([]interface{}, len(values))
+	for i, v := range values {
+		args[i] = v
+	}
+	return args
 }
 
 func (s *Server) handleQueueStatus(w http.ResponseWriter, _ *http.Request) {

@@ -15,25 +15,22 @@ func (b *Bot) notifyTaskChanges(data interface{}) {
 		userID string
 		text   string
 	}
-	b.mu.Lock()
 	var notifications []notification
 	for _, task := range tasks {
-		if task.Status != api.TaskStatusCompleted && task.Status != api.TaskStatusFailed {
+		terminal := task.Status == api.TaskStatusCompleted || task.Status == api.TaskStatusFailed
+		// 取消的任务不发通知，但同样要从追踪表里取出，避免条目永久留在内存里。
+		if !terminal && task.Status != api.TaskStatusCancelled {
+			continue
+		}
+		scopes := b.tracker.Drain(task.ID)
+		if !terminal {
 			continue
 		}
 		text := api.FormatTaskResult(task, false)
-		for userID, taskIDs := range b.userTasks {
-			if _, ok := taskIDs[task.ID]; !ok {
-				continue
-			}
-			delete(taskIDs, task.ID)
-			if len(taskIDs) == 0 {
-				delete(b.userTasks, userID)
-			}
+		for _, userID := range scopes {
 			notifications = append(notifications, notification{userID: userID, text: text})
 		}
 	}
-	b.mu.Unlock()
 
 	for _, n := range notifications {
 		ctx := context.Background()

@@ -20,10 +20,15 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/unkmonster/tmd/internal/bot"
 	"github.com/unkmonster/tmd/internal/config"
 	"github.com/unkmonster/tmd/internal/database"
+	"github.com/unkmonster/tmd/internal/downloading"
+	"github.com/unkmonster/tmd/internal/path"
 	"github.com/unkmonster/tmd/internal/scheduler"
 	"github.com/unkmonster/tmd/internal/service"
+	"github.com/unkmonster/tmd/internal/twitter"
+	"github.com/unkmonster/tmd/internal/utils"
 )
 
 type batchDownloadCall struct {
@@ -35,8 +40,25 @@ type batchDownloadCall struct {
 }
 
 type fakeDownloadService struct {
-	batchCalls chan batchDownloadCall
+	batchCalls          chan batchDownloadCall
+	retryAllFailedCalls chan string
 }
+
+type blockingStartBot struct {
+	started chan struct{}
+	release chan struct{}
+	stopped chan struct{}
+}
+
+func (b *blockingStartBot) Start() error {
+	close(b.started)
+	<-b.release
+	return nil
+}
+
+func (b *blockingStartBot) Stop() { close(b.stopped) }
+
+func (b *blockingStartBot) Name() string { return "blocking-test" }
 
 func (f *fakeDownloadService) UserDownload(context.Context, string, string, service.DownloadOptions, service.ProgressReporter) error {
 	return errors.New("unexpected UserDownload call")
@@ -83,7 +105,10 @@ func (f *fakeDownloadService) BatchDownload(_ context.Context, taskID string, sc
 	return nil
 }
 
-func (f *fakeDownloadService) RetryAllFailed(context.Context, string, service.ProgressReporter) error {
+func (f *fakeDownloadService) RetryAllFailed(_ context.Context, taskID string, _ service.ProgressReporter) error {
+	if f.retryAllFailedCalls != nil {
+		f.retryAllFailedCalls <- taskID
+	}
 	return nil
 }
 
@@ -93,7 +118,7 @@ func (f *fakeDownloadService) ClearErrors() error {
 
 // setupTestServer 创建测试服务器
 func setupTestServer(t *testing.T) (*Server, *sqlx.DB) {
-	return setupTestServerWithAppRoot(t, "/app")
+	return setupTestServerWithAppRoot(t, t.TempDir())
 }
 
 func setupTestServerWithAppRoot(t *testing.T, appRoot string) (*Server, *sqlx.DB) {
@@ -103,7 +128,7 @@ func setupTestServerWithAppRoot(t *testing.T, appRoot string) (*Server, *sqlx.DB
 	}
 
 	// 创建必要的表
-	database.CreateTables(db)
+	require.NoError(t, database.CreateTables(db))
 
 	cfg := &config.Config{
 		RootPath:           t.TempDir(),
@@ -112,7 +137,8 @@ func setupTestServerWithAppRoot(t *testing.T, appRoot string) (*Server, *sqlx.DB
 	}
 
 	client := resty.New()
-	server := NewServer(client, []*resty.Client{}, db, cfg, appRoot, nil)
+	server, err := NewServer(client, []*resty.Client{}, db, cfg, appRoot, nil)
+	require.NoError(t, err)
 	t.Cleanup(server.taskManager.Close)
 	t.Cleanup(func() {
 		if server.downloadQueue != nil {
@@ -126,6 +152,30 @@ func setupTestServerWithAppRoot(t *testing.T, appRoot string) (*Server, *sqlx.DB
 	})
 
 	return server, db
+}
+
+func TestServer_EnqueueTaskRunsExistingTask(t *testing.T) {
+	server, db := setupTestServer(t)
+	defer db.Close()
+
+	fakeService := &fakeDownloadService{batchCalls: make(chan batchDownloadCall, 1)}
+	server.downloadService = fakeService
+
+	task := server.taskManager.CreateTask(TaskTypeBatchDownload, &BatchDownloadTaskData{
+		Users: []string{"alice"},
+		Lists: []StringUint64{123},
+	})
+
+	require.NoError(t, server.EnqueueTask(task))
+
+	select {
+	case call := <-fakeService.batchCalls:
+		assert.Equal(t, task.ID, call.taskID)
+		assert.Equal(t, []string{"alice"}, call.users)
+		assert.Equal(t, []uint64{123}, call.listIDs)
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected enqueued bot/API task to execute")
+	}
 }
 
 type multipartUploadFile struct {
@@ -177,7 +227,8 @@ func TestNewServer(t *testing.T) {
 	}
 
 	client := resty.New()
-	server := NewServer(client, []*resty.Client{}, db, cfg, "/app", nil)
+	server, err := NewServer(client, []*resty.Client{}, db, cfg, "/app", nil)
+	require.NoError(t, err)
 	defer server.taskManager.Close()
 
 	assert.NotNil(t, server)
@@ -190,11 +241,269 @@ func TestNewServer(t *testing.T) {
 	assert.Equal(t, "/app", server.appRootPath)
 }
 
+func TestNewServerReturnsDependencyErrors(t *testing.T) {
+	server, err := NewServer(resty.New(), nil, nil, nil, t.TempDir(), nil)
+
+	assert.Nil(t, server)
+	assert.EqualError(t, err, "server config is nil")
+}
+
+func TestShutdownMutationMiddleware(t *testing.T) {
+	server := &Server{shuttingDown: true}
+
+	for _, method := range []string{
+		http.MethodPost,
+		http.MethodPut,
+		http.MethodPatch,
+		http.MethodDelete,
+	} {
+		t.Run(method, func(t *testing.T) {
+			called := false
+			handler := server.shutdownMutationMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				called = true
+			}))
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, httptest.NewRequest(method, "/api/v1/schedules", nil))
+
+			assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+			assert.False(t, called)
+			assert.Contains(t, recorder.Body.String(), "Server is shutting down")
+		})
+	}
+
+	t.Run("read request", func(t *testing.T) {
+		called := false
+		handler := server.shutdownMutationMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			called = true
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/schedules", nil))
+
+		assert.Equal(t, http.StatusNoContent, recorder.Code)
+		assert.True(t, called)
+	})
+}
+
+func TestBuildHandlerAppliesShutdownGateBeforeAuthentication(t *testing.T) {
+	server := &Server{
+		config:       &config.Config{APIKey: "secret"},
+		shuttingDown: true,
+	}
+	handler := server.buildHandler()
+
+	writeResponse := httptest.NewRecorder()
+	handler.ServeHTTP(writeResponse, httptest.NewRequest(http.MethodPost, "/api/v1/schedules", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, writeResponse.Code)
+	assert.Contains(t, writeResponse.Body.String(), "Server is shutting down")
+
+	readResponse := httptest.NewRecorder()
+	handler.ServeHTTP(readResponse, httptest.NewRequest(http.MethodGet, "/api/v1/schedules", nil))
+	assert.Equal(t, http.StatusUnauthorized, readResponse.Code)
+}
+
+func TestGracefulShutdownWaitsForAdmittedMutation(t *testing.T) {
+	server := &Server{shutdownDone: make(chan struct{})}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	requestDone := make(chan struct{})
+	handler := server.shutdownMutationMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-release
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	go func() {
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPut, "/api/v1/schedules", nil))
+		close(requestDone)
+	}()
+	<-entered
+
+	shutdownReturned := make(chan struct{})
+	go func() {
+		server.GracefulShutdown("test")
+		close(shutdownReturned)
+	}()
+
+	select {
+	case <-shutdownReturned:
+		t.Fatal("shutdown completed while an admitted mutation was still running")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("admitted mutation did not finish")
+	}
+	select {
+	case <-shutdownReturned:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not continue after the mutation finished")
+	}
+}
+
+func TestGracefulShutdownBoundsMutationAndStartupDrains(t *testing.T) {
+	startupDone := make(chan struct{})
+	server := &Server{
+		shutdownDone:    make(chan struct{}),
+		startupDone:     startupDone,
+		shutdownTimeout: 10 * time.Millisecond,
+	}
+	server.activeMutations.Add(1)
+	t.Cleanup(func() {
+		server.activeMutations.Done()
+		close(startupDone)
+	})
+
+	returned := make(chan struct{})
+	go func() {
+		server.GracefulShutdown("timeout-test")
+		close(returned)
+	}()
+
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown remained blocked after drain timeouts")
+	}
+	select {
+	case <-server.shutdownDone:
+	default:
+		t.Fatal("shutdown completion was not published")
+	}
+}
+
+func TestGracefulShutdownSharesSingleDeadlineAcrossPhases(t *testing.T) {
+	// 判别"共享单一截止"而非"每阶段独立超时串行累加"：两个阻塞 phase
+	// （mutation + bot startup）各自 > shutdownTimeout。共享截止总耗时
+	// ≈ shutdownTimeout；串行累加会 ≈ 2×shutdownTimeout。
+	startupDone := make(chan struct{})
+	const phaseTimeout = 200 * time.Millisecond
+	server := &Server{
+		shutdownDone:    make(chan struct{}),
+		startupDone:     startupDone, // botDone 的 <-startupDone 永久阻塞
+		shutdownTimeout: phaseTimeout,
+	}
+	server.activeMutations.Add(1) // mutation phase 永久阻塞
+	t.Cleanup(func() {
+		server.activeMutations.Done()
+		close(startupDone)
+	})
+
+	start := time.Now()
+	server.GracefulShutdown("shared-deadline-test")
+	elapsed := time.Since(start)
+
+	// 共享截止 ≈ 200ms；串行累加 ≈ 400ms。断言界取 1.6× 单阶段超时，
+	// 共享实现余量充足、串行实现必然失败。
+	if elapsed >= 320*time.Millisecond {
+		t.Fatalf("shutdown took %v; phases appear to consume independent timeouts instead of a shared deadline", elapsed)
+	}
+	select {
+	case <-server.shutdownDone:
+	default:
+		t.Fatal("shutdown completion was not published")
+	}
+}
+
+func TestGracefulShutdownIdleServerReturnsImmediately(t *testing.T) {
+	// 判别"空闲立即关、无固定睡眠"：空 server（无 mutation、无 bot、无
+	// queue/scheduler/http）的关停必须毫秒级返回；若回归引入固定 sleep
+	// （如 500ms），本测试失败。
+	server := &Server{
+		shutdownDone:    make(chan struct{}),
+		shutdownTimeout: 45 * time.Second,
+	}
+
+	start := time.Now()
+	server.GracefulShutdown("idle-test")
+	elapsed := time.Since(start)
+
+	if elapsed >= 200*time.Millisecond {
+		t.Fatalf("idle shutdown took %v; a fixed sleep was likely introduced", elapsed)
+	}
+	select {
+	case <-server.shutdownDone:
+	default:
+		t.Fatal("shutdown completion was not published")
+	}
+}
+
+func TestGracefulShutdownCancelsTasksBeforeWaitingForMutations(t *testing.T) {
+	eventBus := NewEventBus()
+	taskManager := NewTaskManager(eventBus)
+	task := taskManager.CreateTask(TaskTypeUserDownload, &UserDownloadTaskData{ScreenName: "alice"})
+	server := &Server{
+		shutdownDone:    make(chan struct{}),
+		shutdownTimeout: time.Second,
+		taskManager:     taskManager,
+		eventBus:        eventBus,
+	}
+	server.activeMutations.Add(1)
+
+	shutdownReturned := make(chan struct{})
+	go func() {
+		server.GracefulShutdown("ordering-test")
+		close(shutdownReturned)
+	}()
+
+	select {
+	case <-task.Ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("shutdown waited for the active mutation before cancelling tasks")
+	}
+	select {
+	case <-shutdownReturned:
+		t.Fatal("shutdown completed while the admitted mutation was still active")
+	default:
+	}
+
+	server.activeMutations.Done()
+	select {
+	case <-shutdownReturned:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not complete after the mutation drained")
+	}
+}
+
+func TestServerStartsBotsConcurrently(t *testing.T) {
+	first := &blockingStartBot{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		stopped: make(chan struct{}),
+	}
+	second := &blockingStartBot{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		stopped: make(chan struct{}),
+	}
+	server := &Server{bots: []bot.Bot{first, second}}
+	done := make(chan struct{})
+	go server.startBots(done)
+
+	for index, started := range []<-chan struct{}{first.started, second.started} {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatalf("bot %d did not start while another provider was blocked", index+1)
+		}
+	}
+	close(first.release)
+	close(second.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("concurrent bot startup did not finish")
+	}
+}
+
 func TestHandleUpdateSchedulesRawInitializesSchedulerAfterStartupParseFailure(t *testing.T) {
 	db, err := sqlx.Connect(database.DriverName, database.MemoryDSN(true))
 	assert.NoError(t, err)
 	defer db.Close()
-	database.CreateTables(db)
+	require.NoError(t, database.CreateTables(db))
 
 	appRoot := t.TempDir()
 	err = os.WriteFile(filepath.Join(appRoot, "schedules.yaml"), []byte("schedules:\n  - type: ["), 0600)
@@ -205,7 +514,8 @@ func TestHandleUpdateSchedulesRawInitializesSchedulerAfterStartupParseFailure(t 
 		MaxDownloadRoutine: 5,
 		MaxFileNameLen:     100,
 	}
-	server := NewServer(resty.New(), []*resty.Client{}, db, cfg, appRoot, nil)
+	server, err := NewServer(resty.New(), []*resty.Client{}, db, cfg, appRoot, nil)
+	require.NoError(t, err)
 	defer server.taskManager.Close()
 	assert.Nil(t, server.scheduler)
 
@@ -229,7 +539,7 @@ func TestHandleGetSchedulesReturnsFrontendFieldNames(t *testing.T) {
 	db, err := sqlx.Connect(database.DriverName, database.MemoryDSN(true))
 	assert.NoError(t, err)
 	defer db.Close()
-	database.CreateTables(db)
+	require.NoError(t, database.CreateTables(db))
 
 	appRoot := t.TempDir()
 	content := `schedules:
@@ -255,7 +565,8 @@ func TestHandleGetSchedulesReturnsFrontendFieldNames(t *testing.T) {
 		MaxDownloadRoutine: 5,
 		MaxFileNameLen:     100,
 	}
-	server := NewServer(resty.New(), []*resty.Client{}, db, cfg, appRoot, nil)
+	server, err := NewServer(resty.New(), []*resty.Client{}, db, cfg, appRoot, nil)
+	require.NoError(t, err)
 	defer server.taskManager.Close()
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/schedules", nil)
@@ -277,7 +588,7 @@ func TestStructuredScheduleCRUDUsesStableID(t *testing.T) {
 	db, err := sqlx.Connect(database.DriverName, database.MemoryDSN(true))
 	assert.NoError(t, err)
 	defer db.Close()
-	database.CreateTables(db)
+	require.NoError(t, database.CreateTables(db))
 
 	appRoot := t.TempDir()
 	cfg := &config.Config{
@@ -285,7 +596,8 @@ func TestStructuredScheduleCRUDUsesStableID(t *testing.T) {
 		MaxDownloadRoutine: 5,
 		MaxFileNameLen:     100,
 	}
-	server := NewServer(resty.New(), []*resty.Client{}, db, cfg, appRoot, nil)
+	server, err := NewServer(resty.New(), []*resty.Client{}, db, cfg, appRoot, nil)
+	require.NoError(t, err)
 	defer server.taskManager.Close()
 
 	createBody := `{"type":"list","target":"12345","name":"List A","schedule":"interval:1h","enabled":true,"run_on_start":false,"auto_follow":true}`
@@ -357,7 +669,7 @@ func TestStructuredScheduleCRUDSupportsMixedAndNormalizesShape(t *testing.T) {
 	db, err := sqlx.Connect(database.DriverName, database.MemoryDSN(true))
 	assert.NoError(t, err)
 	defer db.Close()
-	database.CreateTables(db)
+	require.NoError(t, database.CreateTables(db))
 
 	appRoot := t.TempDir()
 	cfg := &config.Config{
@@ -365,7 +677,8 @@ func TestStructuredScheduleCRUDSupportsMixedAndNormalizesShape(t *testing.T) {
 		MaxDownloadRoutine: 5,
 		MaxFileNameLen:     100,
 	}
-	server := NewServer(resty.New(), []*resty.Client{}, db, cfg, appRoot, nil)
+	server, err := NewServer(resty.New(), []*resty.Client{}, db, cfg, appRoot, nil)
+	require.NoError(t, err)
 	defer server.taskManager.Close()
 
 	createBody := `{"type":"mixed","target":"should-drop","users":["@alice"],"lists":["12345"],"following_names":[" bob "],"name":"Mixed A","schedule":"interval:1h","enabled":true}`
@@ -547,12 +860,21 @@ func TestHandleHealth_DatabaseUnavailable(t *testing.T) {
 func TestFormatTaskMarkTime(t *testing.T) {
 	assert.Nil(t, formatTaskMarkTime(nil))
 
-	ts := time.Date(2026, 4, 30, 18, 30, 45, 0, time.Local)
+	ts := time.Date(2026, 4, 30, 18, 30, 45, 0, time.UTC)
 	got := formatTaskMarkTime(&ts)
 	if got == nil {
 		t.Fatal("expected formatted timestamp")
 	}
-	assert.Equal(t, "2026-04-30T18:30:45", *got)
+	// RFC3339 携带时区偏移：Z 输入保持 UTC，避免下游按服务器本地时区
+	// 二次解释导致标记时间偏移（UTC+8 主机会欠标记 8 小时）。
+	assert.Equal(t, "2026-04-30T18:30:45Z", *got)
+
+	local := time.Date(2026, 4, 30, 18, 30, 45, 0, time.FixedZone("CST", 8*3600))
+	gotLocal := formatTaskMarkTime(&local)
+	if gotLocal == nil {
+		t.Fatal("expected formatted timestamp")
+	}
+	assert.Equal(t, "2026-04-30T18:30:45+08:00", *gotLocal)
 }
 
 func TestServer_EnqueueTaskPassesTaskContextAndReporter(t *testing.T) {
@@ -893,6 +1215,7 @@ func TestServer_QueueWildcardTargetBlocksSpecificTarget(t *testing.T) {
 func TestHandleConfig_Success(t *testing.T) {
 	server, db := setupTestServer(t)
 	defer db.Close()
+	server.config.MaxUserFetchConcurrent = 3
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
 	rr := httptest.NewRecorder()
@@ -911,14 +1234,42 @@ func TestHandleConfig_Success(t *testing.T) {
 	assert.True(t, ok)
 	assert.NotEmpty(t, data["root_path"])
 	assert.Equal(t, float64(5), data["max_download_routine"])
+	assert.Equal(t, float64(3), data["max_user_fetch_concurrent"])
 	assert.Equal(t, float64(100), data["max_file_name_len"])
+}
+
+func TestHandleConfig_ReturnsEffectiveDefaults(t *testing.T) {
+	server, db := setupTestServer(t)
+	defer db.Close()
+	server.config.MaxDownloadRoutine = 0
+	server.config.MaxUserFetchConcurrent = 0
+	server.config.MaxFileNameLen = 0
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
+	rr := httptest.NewRecorder()
+
+	server.handleConfig(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var resp APIResponse
+	err := json.Unmarshal(rr.Body.Bytes(), &resp)
+	assert.NoError(t, err)
+	assert.True(t, resp.Success)
+
+	data, ok := resp.Data.(map[string]interface{})
+	assert.True(t, ok)
+	assert.NotEmpty(t, data["root_path"])
+	assert.Equal(t, float64(config.DefaultMaxDownloadRoutine()), data["max_download_routine"])
+	assert.Equal(t, float64(config.DefaultMaxUserFetchConcurrent()), data["max_user_fetch_concurrent"])
+	assert.Equal(t, float64(utils.DefaultMaxFileNameLen), data["max_file_name_len"])
 }
 
 func TestServer_PutRoutesForConfigFieldsAndCookies(t *testing.T) {
 	db, err := sqlx.Connect(database.DriverName, database.MemoryDSN(true))
 	assert.NoError(t, err)
 	defer db.Close()
-	database.CreateTables(db)
+	require.NoError(t, database.CreateTables(db))
 
 	appRoot := t.TempDir()
 	cfg := &config.Config{
@@ -927,11 +1278,12 @@ func TestServer_PutRoutesForConfigFieldsAndCookies(t *testing.T) {
 		MaxFileNameLen:     100,
 	}
 
-	server := NewServer(resty.New(), []*resty.Client{}, db, cfg, appRoot, nil)
+	server, err := NewServer(resty.New(), []*resty.Client{}, db, cfg, appRoot, nil)
+	require.NoError(t, err)
 	defer server.taskManager.Close()
 	handler := server.buildHandler()
 
-	configBody := `{"fields":{"root_path":"` + strings.ReplaceAll(appRoot, `\`, `\\`) + `","auth_token":"new-auth","ct0":"new-ct0","max_download_routine":"6","max_file_name_len":"120","proxy_url":""}}`
+	configBody := `{"fields":{"root_path":"` + strings.ReplaceAll(appRoot, `\`, `\\`) + `","auth_token":"new-auth","ct0":"new-ct0","max_download_routine":"6","max_user_fetch_concurrent":"7","max_file_name_len":"120","proxy_url":""}}`
 	configReq := httptest.NewRequest(http.MethodPut, "/api/v1/config/fields", bytes.NewBufferString(configBody))
 	configReq.Header.Set("Content-Type", "application/json")
 	configRR := httptest.NewRecorder()
@@ -945,6 +1297,7 @@ func TestServer_PutRoutesForConfigFieldsAndCookies(t *testing.T) {
 	assert.Contains(t, configData["message"], "restart TMD manually")
 	_, hasApplied := configData["applied"]
 	assert.False(t, hasApplied)
+	assert.Equal(t, 7, server.config.MaxUserFetchConcurrent)
 	if _, err := os.Stat(filepath.Join(appRoot, "conf.yaml")); err != nil {
 		t.Fatalf("expected conf.yaml to be written: %v", err)
 	}
@@ -970,12 +1323,13 @@ func TestServer_UpdateConfigRawRejectsInvalidSemanticConfig(t *testing.T) {
 	db, err := sqlx.Connect(database.DriverName, database.MemoryDSN(true))
 	assert.NoError(t, err)
 	defer db.Close()
-	database.CreateTables(db)
+	require.NoError(t, database.CreateTables(db))
 
 	appRoot := t.TempDir()
 	cfg := &config.Config{RootPath: appRoot}
 
-	server := NewServer(resty.New(), []*resty.Client{}, db, cfg, appRoot, nil)
+	server, err := NewServer(resty.New(), []*resty.Client{}, db, cfg, appRoot, nil)
+	require.NoError(t, err)
 	defer server.taskManager.Close()
 	handler := server.buildHandler()
 
@@ -994,12 +1348,13 @@ func TestServer_UpdateConfigRawPersistsNormalizedConfig(t *testing.T) {
 	db, err := sqlx.Connect(database.DriverName, database.MemoryDSN(true))
 	assert.NoError(t, err)
 	defer db.Close()
-	database.CreateTables(db)
+	require.NoError(t, database.CreateTables(db))
 
 	appRoot := t.TempDir()
 	cfg := &config.Config{RootPath: appRoot}
 
-	server := NewServer(resty.New(), []*resty.Client{}, db, cfg, appRoot, nil)
+	server, err := NewServer(resty.New(), []*resty.Client{}, db, cfg, appRoot, nil)
+	require.NoError(t, err)
 	defer server.taskManager.Close()
 	handler := server.buildHandler()
 
@@ -1029,7 +1384,7 @@ func TestServer_SaveCookiesFailsWhenExistingCookiesUnreadable(t *testing.T) {
 	db, err := sqlx.Connect(database.DriverName, database.MemoryDSN(true))
 	assert.NoError(t, err)
 	defer db.Close()
-	database.CreateTables(db)
+	require.NoError(t, database.CreateTables(db))
 
 	appRoot := t.TempDir()
 	cfg := &config.Config{
@@ -1038,7 +1393,8 @@ func TestServer_SaveCookiesFailsWhenExistingCookiesUnreadable(t *testing.T) {
 		MaxFileNameLen:     100,
 	}
 
-	server := NewServer(resty.New(), []*resty.Client{}, db, cfg, appRoot, nil)
+	server, err := NewServer(resty.New(), []*resty.Client{}, db, cfg, appRoot, nil)
+	require.NoError(t, err)
 	defer server.taskManager.Close()
 	handler := server.buildHandler()
 
@@ -1058,7 +1414,7 @@ func TestServer_SaveCookiesKeepsOldValuesByOriginalIndex(t *testing.T) {
 	db, err := sqlx.Connect(database.DriverName, database.MemoryDSN(true))
 	assert.NoError(t, err)
 	defer db.Close()
-	database.CreateTables(db)
+	require.NoError(t, database.CreateTables(db))
 
 	appRoot := t.TempDir()
 	cfg := &config.Config{
@@ -1067,7 +1423,8 @@ func TestServer_SaveCookiesKeepsOldValuesByOriginalIndex(t *testing.T) {
 		MaxFileNameLen:     100,
 	}
 
-	server := NewServer(resty.New(), []*resty.Client{}, db, cfg, appRoot, nil)
+	server, err := NewServer(resty.New(), []*resty.Client{}, db, cfg, appRoot, nil)
+	require.NoError(t, err)
 	defer server.taskManager.Close()
 	handler := server.buildHandler()
 
@@ -1121,11 +1478,13 @@ func TestHandleUserDownload_Success(t *testing.T) {
 	defer db.Close()
 
 	reqData := UserDownloadTaskData{
-		ScreenName:    "testuser",
-		AutoFollow:    true,
-		FollowMembers: true,
-		SkipProfile:   false,
-		NoRetry:       false,
+		ScreenName: "testuser",
+		DownloadFlags: DownloadFlags{
+			AutoFollow:    true,
+			FollowMembers: true,
+			SkipProfile:   false,
+			NoRetry:       false,
+		},
 	}
 	body, _ := json.Marshal(reqData)
 
@@ -1266,9 +1625,11 @@ func TestHandleFollowingDownload_Success(t *testing.T) {
 	defer db.Close()
 
 	reqData := FollowingDownloadTaskData{
-		ScreenName:    "testuser",
-		AutoFollow:    true,
-		FollowMembers: true,
+		ScreenName: "testuser",
+		DownloadFlags: DownloadFlags{
+			AutoFollow:    true,
+			FollowMembers: true,
+		},
 	}
 	body, _ := json.Marshal(reqData)
 
@@ -1330,10 +1691,12 @@ func TestHandleListDownload_Success(t *testing.T) {
 	defer db.Close()
 
 	reqData := ListDownloadTaskData{
-		ListID:        123,
-		AutoFollow:    true,
-		FollowMembers: true,
-		SkipProfile:   false,
+		ListID: 123,
+		DownloadFlags: DownloadFlags{
+			AutoFollow:    true,
+			FollowMembers: true,
+			SkipProfile:   false,
+		},
 	}
 	body, _ := json.Marshal(reqData)
 
@@ -1656,11 +2019,13 @@ func TestHandleBatchDownload_OnlyUsers(t *testing.T) {
 	defer db.Close()
 
 	reqData := BatchDownloadTaskData{
-		Users:         []string{"user1", "user2"},
-		Lists:         []StringUint64{},
-		AutoFollow:    true,
-		FollowMembers: true,
-		SkipProfile:   false,
+		Users: []string{"user1", "user2"},
+		Lists: []StringUint64{},
+		DownloadFlags: DownloadFlags{
+			AutoFollow:    true,
+			FollowMembers: true,
+			SkipProfile:   false,
+		},
 	}
 	body, _ := json.Marshal(reqData)
 
@@ -1717,12 +2082,14 @@ func TestHandleBatchDownload_BothUsersAndLists(t *testing.T) {
 	defer db.Close()
 
 	reqData := BatchDownloadTaskData{
-		Users:         []string{"user1"},
-		Lists:         []StringUint64{100},
-		AutoFollow:    true,
-		FollowMembers: true,
-		SkipProfile:   true,
-		NoRetry:       true,
+		Users: []string{"user1"},
+		Lists: []StringUint64{100},
+		DownloadFlags: DownloadFlags{
+			AutoFollow:    true,
+			FollowMembers: true,
+			SkipProfile:   true,
+			NoRetry:       true,
+		},
 	}
 	body, _ := json.Marshal(reqData)
 
@@ -1794,7 +2161,8 @@ func TestScheduledDownloadMixedCreatesBatchTaskAndCallsService(t *testing.T) {
 	fakeService := &fakeDownloadService{batchCalls: make(chan batchDownloadCall, 1)}
 	server.downloadService = fakeService
 
-	taskID := server.scheduledDownload(scheduler.ScheduleEntry{
+	taskID, _ := server.scheduledDownload(scheduler.ScheduleEntry{
+		ID:             "mixed-entry",
 		Type:           scheduler.ScheduleTypeMixed,
 		Users:          []string{"@user1"},
 		Lists:          []string{"123", "456"},
@@ -1816,6 +2184,7 @@ func TestScheduledDownloadMixedCreatesBatchTaskAndCallsService(t *testing.T) {
 	assert.True(t, data.FollowMembers)
 	assert.True(t, data.SkipProfile)
 	assert.True(t, data.NoRetry)
+	assert.Equal(t, "mixed-entry", task.EntryID)
 
 	select {
 	case call := <-fakeService.batchCalls:
@@ -1836,7 +2205,7 @@ func TestScheduledDownloadUser_NormalizesAndValidatesTarget(t *testing.T) {
 	server, db := setupTestServer(t)
 	defer db.Close()
 
-	taskID := server.scheduledDownload(scheduler.ScheduleEntry{
+	taskID, _ := server.scheduledDownload(scheduler.ScheduleEntry{
 		Type:   scheduler.ScheduleTypeUser,
 		Target: " @Alice ",
 	})
@@ -1848,18 +2217,43 @@ func TestScheduledDownloadUser_NormalizesAndValidatesTarget(t *testing.T) {
 	assert.True(t, ok)
 	assert.Equal(t, "Alice", data.ScreenName)
 
-	invalidTaskID := server.scheduledDownload(scheduler.ScheduleEntry{
+	invalidTaskID, _ := server.scheduledDownload(scheduler.ScheduleEntry{
 		Type:   scheduler.ScheduleTypeUser,
 		Target: "坏名字",
 	})
 	assert.Empty(t, invalidTaskID)
 }
 
+// TestScheduledDownloadList_RejectsAtPrefixedTarget 守护 list 目标解析与校验
+// 一致性：ValidateEntry 对 "@123" 拒绝（list 不剥 @），且即使绕过校验直传
+// 也必须在提取层拒绝，而不是静默生成 ListID=0 任务。
+func TestScheduledDownloadList_RejectsAtPrefixedTarget(t *testing.T) {
+	server, db := setupTestServer(t)
+	defer db.Close()
+
+	taskID, _ := server.scheduledDownload(scheduler.ScheduleEntry{
+		Type:   scheduler.ScheduleTypeList,
+		Target: "@123",
+	})
+	assert.Empty(t, taskID, "at-prefixed list target must be rejected, not enqueued as list 0")
+
+	validID, _ := server.scheduledDownload(scheduler.ScheduleEntry{
+		Type:   scheduler.ScheduleTypeList,
+		Target: "123",
+	})
+	assert.NotEmpty(t, validID)
+	task, ok := server.taskManager.GetTask(validID)
+	assert.True(t, ok)
+	data, ok := task.Data.(*ListDownloadTaskData)
+	assert.True(t, ok)
+	assert.Equal(t, StringUint64(123), data.ListID)
+}
+
 func TestScheduledDownloadFollowing_NormalizesAndValidatesTarget(t *testing.T) {
 	server, db := setupTestServer(t)
 	defer db.Close()
 
-	taskID := server.scheduledDownload(scheduler.ScheduleEntry{
+	taskID, _ := server.scheduledDownload(scheduler.ScheduleEntry{
 		Type:   scheduler.ScheduleTypeFollowing,
 		Target: " @Bob ",
 	})
@@ -1871,11 +2265,33 @@ func TestScheduledDownloadFollowing_NormalizesAndValidatesTarget(t *testing.T) {
 	assert.True(t, ok)
 	assert.Equal(t, "Bob", data.ScreenName)
 
-	invalidTaskID := server.scheduledDownload(scheduler.ScheduleEntry{
+	invalidTaskID, _ := server.scheduledDownload(scheduler.ScheduleEntry{
 		Type:   scheduler.ScheduleTypeFollowing,
 		Target: "??bad??",
 	})
 	assert.Empty(t, invalidTaskID)
+}
+
+func TestScheduledDownloadUsesUnifiedAdmissionWhenQueueIsClosed(t *testing.T) {
+	server, db := setupTestServer(t)
+	defer db.Close()
+
+	server.downloadQueue.CloseAndWait(time.Second)
+	server.downloadQueue = &DownloadQueue{closed: true, detached: make(map[string]*detachedRun)}
+
+	taskID, _ := server.scheduledDownload(scheduler.ScheduleEntry{
+		ID:     "schedule-user",
+		Type:   scheduler.ScheduleTypeUser,
+		Target: "alice",
+	})
+
+	assert.Empty(t, taskID)
+	tasks := server.taskManager.GetAllTasks()
+	require.Len(t, tasks, 1)
+	assert.Equal(t, TaskTypeUserDownload, tasks[0].Type)
+	assert.Equal(t, "schedule-user", tasks[0].EntryID)
+	assert.Equal(t, TaskStatusFailed, tasks[0].Status)
+	assert.NotEmpty(t, tasks[0].Error)
 }
 
 func TestCleanupUploadDirAfterTask_CleansAfterTaskReturns(t *testing.T) {
@@ -2106,25 +2522,78 @@ func TestWriteError(t *testing.T) {
 	assert.False(t, resp.Success)
 	assert.Equal(t, "test error", resp.Error)
 }
-
-func TestServer_Start(t *testing.T) {
-	// 这个测试主要验证 Start 方法不会 panic
-	// 实际启动服务器会阻塞，所以只验证配置
-	server, db := setupTestServer(t)
-	defer db.Close()
-
-	// 验证服务器配置正确
-	assert.NotNil(t, server)
-	assert.NotNil(t, server.client)
-	assert.NotNil(t, server.db)
-	assert.NotNil(t, server.config)
-	assert.NotNil(t, server.taskManager)
-}
-
 func TestServer_GracefulShutdownCompletes(t *testing.T) {
 	server, _ := setupTestServer(t)
 	server.GracefulShutdown("shutdown")
 	server.WaitForShutdown()
+}
+
+func TestServer_StartAfterShutdownReturnsServerClosed(t *testing.T) {
+	server, _ := setupTestServer(t)
+	server.GracefulShutdown("before-start")
+
+	err := server.Start(0)
+
+	assert.ErrorIs(t, err, http.ErrServerClosed)
+	assert.Nil(t, server.httpServer)
+}
+
+func TestServer_StartDoesNotHoldLifecycleLockWhileBotStarts(t *testing.T) {
+	testBot := &blockingStartBot{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		stopped: make(chan struct{}),
+	}
+	server := &Server{
+		shutdownDone: make(chan struct{}),
+		botCallbacks: make(map[string]http.HandlerFunc),
+		bots:         []bot.Bot{testBot},
+	}
+	startDone := make(chan error, 1)
+	go func() { startDone <- server.Start(0) }()
+
+	select {
+	case <-testBot.started:
+	case <-time.After(time.Second):
+		t.Fatal("bot startup did not begin")
+	}
+
+	lockAvailable := make(chan struct{})
+	go func() {
+		if server.lifecycleMu.TryLock() {
+			server.lifecycleMu.Unlock()
+			close(lockAvailable)
+		}
+	}()
+	select {
+	case <-lockAvailable:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("server held lifecycle lock while bot startup was blocked")
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		server.GracefulShutdown("during-start")
+		close(shutdownDone)
+	}()
+	close(testBot.release)
+
+	select {
+	case err := <-startDone:
+		assert.ErrorIs(t, err, http.ErrServerClosed)
+	case <-time.After(2 * time.Second):
+		t.Fatal("server startup did not stop after shutdown")
+	}
+	select {
+	case <-shutdownDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server shutdown did not complete")
+	}
+	select {
+	case <-testBot.stopped:
+	default:
+		t.Fatal("started bot was not stopped")
+	}
 }
 
 func TestServer_GracefulShutdownWaitsForDetachedTaskExit(t *testing.T) {
@@ -2459,41 +2928,6 @@ func TestServer_LargeResponse(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rr.Code)
 	assert.Greater(t, rr.Body.Len(), 0)
 }
-
-func TestServer_RequestPathVariations(t *testing.T) {
-	server, db := setupTestServer(t)
-	defer db.Close()
-
-	tests := []struct {
-		name   string
-		method string
-		path   string
-	}{
-		{"健康检查 GET", http.MethodGet, "/api/v1/health"},
-		{"配置 GET", http.MethodGet, "/api/v1/config"},
-		{"任务列表 GET", http.MethodGet, "/api/v1/tasks"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(tt.method, tt.path, nil)
-			rr := httptest.NewRecorder()
-
-			// 根据路径调用相应的 handler
-			switch {
-			case strings.HasSuffix(tt.path, "/health"):
-				server.handleHealth(rr, req)
-			case strings.HasSuffix(tt.path, "/config"):
-				server.handleConfig(rr, req)
-			case strings.HasSuffix(tt.path, "/tasks") && !strings.Contains(tt.path, "task_id"):
-				server.handleTasks(rr, req)
-			}
-
-			// 验证不会 panic
-		})
-	}
-}
-
 func TestHandleTaskStats(t *testing.T) {
 	t.Run("空统计", func(t *testing.T) {
 		server, db := setupTestServer(t)
@@ -2751,6 +3185,95 @@ func TestHandleErrors(t *testing.T) {
 	assert.NotNil(t, data["json"])
 }
 
+// 失败记录带实体名：regular_details 让界面不必显示裸实体 ID。
+func TestHandleErrorsEntityDetails(t *testing.T) {
+	server, db := setupTestServer(t)
+	defer db.Close()
+
+	require.NoError(t, database.CreateUser(db, &database.User{Id: 4242, ScreenName: "probeuser", Name: "Probe User"}))
+
+	ue := &database.UserEntity{UserId: 4242, Name: "probeuser", ParentDir: "users"}
+	require.NoError(t, database.CreateUserEntity(db, ue))
+	entityID := int(ue.Id.Int32)
+
+	// 失败记录的键是 user_entities.id；实体被删除时只留 ID 与计数。
+	missingID := entityID + 1000
+
+	storePath, err := path.NewStorePath(server.config.RootPath)
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Dir(storePath.ErrorsPath), 0755))
+
+	dumper := downloading.NewDumper()
+	dumper.Push(entityID, &twitter.Tweet{Id: 1}, &twitter.Tweet{Id: 2})
+	dumper.Push(missingID, &twitter.Tweet{Id: 3})
+	require.NoError(t, dumper.Dump(storePath.ErrorsPath))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/errors", nil)
+	rr := serveAPI(server, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	var resp struct {
+		Success bool                 `json:"success"`
+		Data    ErrorSummaryResponse `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+	require.True(t, resp.Success)
+	require.Len(t, resp.Data.RegularDetails, 2)
+
+	first := resp.Data.RegularDetails[0]
+	assert.Equal(t, entityID, first.EntityID)
+	assert.Equal(t, "user", first.Kind)
+	assert.Equal(t, "probeuser", first.Name)
+	assert.Equal(t, "probeuser", first.ScreenName)
+	assert.Equal(t, uint64(4242), first.UserID)
+	assert.Equal(t, 2, first.Failed)
+
+	second := resp.Data.RegularDetails[1]
+	assert.Equal(t, missingID, second.EntityID)
+	assert.Empty(t, second.Kind)
+	assert.Empty(t, second.Name)
+	assert.Equal(t, 1, second.Failed)
+}
+
+// 失败记录也可能属于列表实体：lst_entities.id 与 user_entities.id 共用同一区间，
+// 未命中 user_entities 的 ID 必须回落到 lst_entities，否则界面只能显示裸 ID。
+func TestHandleErrorsEntityDetailsListEntity(t *testing.T) {
+	server, db := setupTestServer(t)
+	defer db.Close()
+
+	require.NoError(t, database.CreateUser(db, &database.User{Id: 777, ScreenName: "owner", Name: "Owner"}))
+	require.NoError(t, database.CreateLst(db, &database.Lst{Id: 2003, Name: "Watchlist", OwnerUserId: 777}))
+
+	le := &database.LstEntity{LstId: 2003, Name: "members", ParentDir: "lists"}
+	require.NoError(t, database.CreateLstEntity(db, le))
+	entityID := int(le.Id.Int32)
+
+	storePath, err := path.NewStorePath(server.config.RootPath)
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Dir(storePath.ErrorsPath), 0755))
+
+	dumper := downloading.NewDumper()
+	dumper.Push(entityID, &twitter.Tweet{Id: 1})
+	require.NoError(t, dumper.Dump(storePath.ErrorsPath))
+
+	rr := serveAPI(server, httptest.NewRequest(http.MethodGet, "/api/v1/errors", nil))
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	var resp struct {
+		Success bool                 `json:"success"`
+		Data    ErrorSummaryResponse `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+	require.Len(t, resp.Data.RegularDetails, 1)
+
+	detail := resp.Data.RegularDetails[0]
+	assert.Equal(t, entityID, detail.EntityID)
+	assert.Equal(t, "list", detail.Kind)
+	assert.Equal(t, "members", detail.Name)
+	assert.Equal(t, "Watchlist", detail.ScreenName)
+	assert.Equal(t, 1, detail.Failed)
+}
+
 func TestHandleBatchMark(t *testing.T) {
 	server, db := setupTestServer(t)
 	defer db.Close()
@@ -2775,6 +3298,8 @@ func TestHandleBatchMark(t *testing.T) {
 func TestHandleRetryAllFailed(t *testing.T) {
 	server, db := setupTestServer(t)
 	defer db.Close()
+	fakeService := &fakeDownloadService{retryAllFailedCalls: make(chan string, 1)}
+	server.downloadService = fakeService
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/errors/retry", nil)
 	rr := serveAPI(server, req)
@@ -2785,6 +3310,33 @@ func TestHandleRetryAllFailed(t *testing.T) {
 	err := json.Unmarshal(rr.Body.Bytes(), &resp)
 	assert.NoError(t, err)
 	assert.True(t, resp.Success)
+
+	tasks := server.taskManager.GetAllTasks()
+	require.Len(t, tasks, 1)
+	assert.Equal(t, TaskTypeRetryAllFailed, tasks[0].Type)
+	assert.Nil(t, tasks[0].Data)
+	select {
+	case taskID := <-fakeService.retryAllFailedCalls:
+		assert.Equal(t, tasks[0].ID, taskID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for retry-all task to execute")
+	}
+}
+
+func TestHandleRetryAllFailedRejectsClosedQueue(t *testing.T) {
+	server, db := setupTestServer(t)
+	defer db.Close()
+
+	server.downloadQueue.CloseAndWait(time.Second)
+	server.downloadQueue = &DownloadQueue{closed: true, detached: make(map[string]*detachedRun)}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/errors/retry", nil)
+	rr := serveAPI(server, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, rr.Code)
+	tasks := server.taskManager.GetAllTasks()
+	require.Len(t, tasks, 1)
+	assert.Equal(t, TaskTypeRetryAllFailed, tasks[0].Type)
+	assert.Equal(t, TaskStatusFailed, tasks[0].Status)
 }
 
 func TestHandleClearErrors(t *testing.T) {
@@ -2817,15 +3369,15 @@ func TestHandleGetTheme_ReturnsDefault(t *testing.T) {
 
 	data, ok := resp.Data.(map[string]interface{})
 	assert.True(t, ok)
-	assert.Equal(t, "web1", data["theme"])
+	assert.Equal(t, "download", data["theme"])
 }
 
-func TestHandleSetTheme_SwitchesToWeb2(t *testing.T) {
+func TestHandleSetTheme_SwitchesToDownload(t *testing.T) {
 	orig := getFrontendTheme()
 	defer setFrontendTheme(orig)
 
 	server := &Server{}
-	body := `{"theme":"web2"}`
+	body := `{"theme":"download"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/config/theme", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
@@ -2840,8 +3392,8 @@ func TestHandleSetTheme_SwitchesToWeb2(t *testing.T) {
 
 	data, ok := resp.Data.(map[string]interface{})
 	assert.True(t, ok)
-	assert.Equal(t, "web2", data["theme"])
-	assert.Equal(t, "web2", getFrontendTheme())
+	assert.Equal(t, "download", data["theme"])
+	assert.Equal(t, "download", getFrontendTheme())
 }
 
 func TestHandleSetTheme_InvalidBody(t *testing.T) {
@@ -2896,10 +3448,73 @@ func TestHandleGetThemes_ReturnsList(t *testing.T) {
 
 	themes, ok := data["themes"].([]interface{})
 	assert.True(t, ok)
-	assert.Contains(t, themes, "web1")
-	assert.Contains(t, themes, "web2")
+	assert.Contains(t, themes, "download")
 
 	current, ok := data["current"].(string)
 	assert.True(t, ok)
 	assert.NotEmpty(t, current)
+}
+
+// TestHandleTriggerSchedule_ErrorStatusCodes 守护 trigger 错误码语义：
+// not found→404、disabled→409、already triggering→409（修复前统一 400）。
+func TestHandleTriggerSchedule_ErrorStatusCodes(t *testing.T) {
+	server, db := setupTestServer(t)
+	defer db.Close()
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "schedules.yaml")
+	require.NoError(t, os.WriteFile(configPath, []byte(`schedules:
+  - id: sched-disabled
+    type: user
+    target: alice
+    name: Alice
+    schedule: "interval:1h"
+    enabled: false
+  - id: sched-active
+    type: user
+    target: bob
+    name: Bob
+    schedule: "interval:1h"
+    enabled: true
+`), 0600))
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	sched, err := scheduler.New(configPath, func(entry scheduler.ScheduleEntry) (string, error) {
+		close(started)
+		<-release
+		return "task-1", nil
+	})
+	require.NoError(t, err)
+	server.schedulerMu.Lock()
+	server.scheduler = sched
+	server.schedulerMu.Unlock()
+
+	trigger := func(id string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/schedules/"+id+"/trigger", nil)
+		req.SetPathValue("id", id)
+		rr := httptest.NewRecorder()
+		server.handleTriggerSchedule(rr, req)
+		return rr
+	}
+
+	// not found → 404
+	rr := trigger("does-not-exist")
+	assert.Equal(t, http.StatusNotFound, rr.Code)
+
+	// disabled → 409
+	rr = trigger("sched-disabled")
+	assert.Equal(t, http.StatusConflict, rr.Code)
+
+	// already triggering → 409（downloadFunc 阻塞期间二次触发）
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		_ = trigger("sched-active")
+	}()
+	<-started
+	rr = trigger("sched-active")
+	assert.Equal(t, http.StatusConflict, rr.Code)
+	close(release)
+	<-firstDone
 }

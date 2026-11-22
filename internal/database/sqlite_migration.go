@@ -32,6 +32,14 @@ func migrateExistingDatabase(path string) error {
 		}
 	}
 
+	// 迁移会替换数据库文件：必须保证同一时刻只有一个实例在做，否则另一实例
+	// 的写入会随替换丢失。锁文件带 PID，崩溃遗留的锁 10 分钟后视为过期。
+	releaseLock, err := acquireMigrationLock(path)
+	if err != nil {
+		return err
+	}
+	defer releaseLock()
+
 	backupPath, err := backupSQLiteFiles(path)
 	if err != nil {
 		return fmt.Errorf("failed to back up database %q before migration: %w", path, err)
@@ -60,7 +68,11 @@ func migrateExistingDatabase(path string) error {
 	}
 
 	configureSQLiteConnection(targetDB)
-	CreateTables(targetDB)
+	if err := CreateTables(targetDB); err != nil {
+		targetDB.Close()
+		removeSQLiteFiles(tempPath)
+		return fmt.Errorf("failed to create migration target tables at %q: %w", tempPath, err)
+	}
 	if err := MigrateDatabase(targetDB); err != nil {
 		targetDB.Close()
 		removeSQLiteFiles(tempPath)
@@ -96,15 +108,65 @@ func backupSQLiteFiles(path string) (string, error) {
 	timestamp := time.Now().Format("20060102_150405")
 	backupPath := path + ".backup." + timestamp
 
-	if err := copyFile(path, backupPath); err != nil {
-		return "", err
-	}
-	for _, suffix := range []string{"-wal", "-shm"} {
-		if err := copyFileIfExists(path+suffix, backupPath+suffix); err != nil {
+	// VACUUM INTO 产出的单文件快照在事务边界上一致，不需要再单独复制
+	// -wal/-shm；旧版 SQLite 不支持时退回逐文件复制。
+	if err := vacuumInto(path, backupPath); err != nil {
+		removeSQLiteFiles(backupPath)
+		if err := copyFile(path, backupPath); err != nil {
 			return "", err
+		}
+		for _, suffix := range []string{"-wal", "-shm"} {
+			if err := copyFileIfExists(path+suffix, backupPath+suffix); err != nil {
+				return "", err
+			}
 		}
 	}
 	return backupPath, nil
+}
+
+// vacuumInto 用 SQLite 自身的 VACUUM INTO 生成一致性快照。
+func vacuumInto(srcPath, dstPath string) error {
+	db, err := openSQLiteFile(srcPath, false)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if _, err := db.Exec("VACUUM INTO ?", dstPath); err != nil {
+		return fmt.Errorf("vacuum into %q: %w", dstPath, err)
+	}
+	return nil
+}
+
+const migrationLockSuffix = ".migration.lock"
+
+// acquireMigrationLock 用 O_EXCL 锁文件把迁移串行化，返回释放函数。
+// 崩溃遗留的锁超过 10 分钟即视为过期，避免永久阻塞启动。
+func acquireMigrationLock(path string) (func(), error) {
+	return acquireMigrationLockFor(path, 2*time.Second)
+}
+
+func acquireMigrationLockFor(path string, wait time.Duration) (func(), error) {
+	lockPath := path + migrationLockSuffix
+	deadline := time.Now().Add(wait)
+	for {
+		file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err == nil {
+			_, _ = fmt.Fprintf(file, "%d\n", os.Getpid())
+			_ = file.Close()
+			return func() { _ = os.Remove(lockPath) }, nil
+		}
+		if !os.IsExist(err) {
+			return nil, fmt.Errorf("create migration lock %q: %w", lockPath, err)
+		}
+		if info, statErr := os.Stat(lockPath); statErr == nil && time.Since(info.ModTime()) > 10*time.Minute {
+			_ = os.Remove(lockPath)
+			continue
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("another instance is migrating database %q (lock %q exists)", path, lockPath)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func copyFile(srcPath string, dstPath string) error {
@@ -176,6 +238,45 @@ func replaceSQLiteFiles(path string, tempPath string) error {
 	return nil
 }
 
+// recoverInterruptedSQLiteReplacement restores the original database when a
+// process stopped after moving it to .replacing but before a migrated main file
+// reached path. A stranded .migrating file without that original is ambiguous,
+// so callers must fail closed rather than let SQLite create a blank database.
+func recoverInterruptedSQLiteReplacement(path string) (bool, error) {
+	exists, err := fileExists(path)
+	if err != nil {
+		return false, fmt.Errorf("inspect database path %q: %w", path, err)
+	}
+	if exists {
+		return false, nil
+	}
+
+	holdingPath := path + ".replacing"
+	holdingExists, err := fileExists(holdingPath)
+	if err != nil {
+		return false, fmt.Errorf("inspect original replacement path %q: %w", holdingPath, err)
+	}
+	tempPath := path + ".migrating"
+	tempExists, err := fileExists(tempPath)
+	if err != nil {
+		return false, fmt.Errorf("inspect migration target %q: %w", tempPath, err)
+	}
+
+	if holdingExists {
+		if err := moveSQLiteFiles(holdingPath, path, true); err != nil {
+			return false, fmt.Errorf("restore original database from %q: %w", holdingPath, err)
+		}
+		// No application writes occur while the rebuild is replacing files, so
+		// the uncommitted migration target cannot contain newer user data.
+		removeSQLiteFiles(tempPath)
+		return true, nil
+	}
+	if tempExists {
+		return false, fmt.Errorf("database main file is missing while uncommitted migration target %q remains; refusing to create a new database", tempPath)
+	}
+	return false, nil
+}
+
 func moveSQLiteFiles(srcPath string, dstPath string, requireMain bool) error {
 	movedSuffixes := make([]string, 0, 3)
 	for _, suffix := range []string{"", "-wal", "-shm"} {
@@ -243,6 +344,9 @@ func copyAllData(sourceDB *sqlx.DB, targetDB *sqlx.DB) error {
 	if err := copyUserLinks(sourceTx, tx); err != nil {
 		return err
 	}
+	if err := copyEntityRemovalJournals(sourceTx, tx); err != nil {
+		return err
+	}
 
 	if err := validateRowCounts(sourceTx, tx); err != nil {
 		return err
@@ -255,6 +359,16 @@ func copyAllData(sourceDB *sqlx.DB, targetDB *sqlx.DB) error {
 }
 
 func copyUsers(sourceDB *sqlx.Tx, targetTx *sqlx.Tx) error {
+	exists, err := tableExists(sourceDB, "users")
+	if err != nil {
+		return err
+	}
+	// 0 字节 / 空 SQLite 文件会被驱动视为合法库：没有 users 表时按空库处理，
+	// 否则重建路径会在 SELECT 阶段失败，且每次启动都重复失败。
+	if !exists {
+		return nil
+	}
+
 	userColumns, err := getTableColumns(sourceDB, "users")
 	if err != nil {
 		return err
@@ -455,12 +569,44 @@ func copyUserLinks(sourceDB *sqlx.Tx, targetTx *sqlx.Tx) error {
 	return nil
 }
 
+func copyEntityRemovalJournals(sourceDB *sqlx.Tx, targetTx *sqlx.Tx) error {
+	exists, err := tableExists(sourceDB, "entity_removal_journal")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+
+	var journals []EntityRemovalJournal
+	if err := sourceDB.Select(&journals, `SELECT staged_path, original_path FROM entity_removal_journal ORDER BY staged_path`); err != nil {
+		return fmt.Errorf("failed to load entity removal journals for migration: %w", err)
+	}
+	for _, journal := range journals {
+		if _, err := targetTx.Exec(
+			`INSERT INTO entity_removal_journal(staged_path, original_path) VALUES(?, ?)`,
+			journal.StagedPath,
+			journal.OriginalPath,
+		); err != nil {
+			return fmt.Errorf("failed to insert entity removal journal %q during migration: %w", journal.StagedPath, err)
+		}
+	}
+	return nil
+}
+
 func validateRowCounts(sourceDB *sqlx.Tx, targetQueryer interface {
 	Get(dest interface{}, query string, args ...interface{}) error
 }) error {
-	tableNames := make([]string, 0, len(requiredSchema))
+	tableNames := make([]string, 0, len(requiredSchema)+1)
 	for tableName := range requiredSchema {
 		tableNames = append(tableNames, tableName)
+	}
+	journalExists, err := tableExists(sourceDB, "entity_removal_journal")
+	if err != nil {
+		return err
+	}
+	if journalExists {
+		tableNames = append(tableNames, "entity_removal_journal")
 	}
 	sort.Strings(tableNames)
 
@@ -488,6 +634,9 @@ func validateRowCounts(sourceDB *sqlx.Tx, targetQueryer interface {
 	return nil
 }
 
+// nullInt32Value 将 sql.NullInt32 转为 INSERT 绑定值：有效值返回 int32，
+// 无效值返回 nil 让 SQLite 存储 NULL。与 model.go 的 NullInt32（无效→0，
+// 用于内存计算）语义有意不同。
 func nullInt32Value(value sql.NullInt32) interface{} {
 	if value.Valid {
 		return value.Int32

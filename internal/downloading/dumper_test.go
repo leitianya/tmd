@@ -7,7 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jmoiron/sqlx"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/unkmonster/tmd/internal/database"
 	"github.com/unkmonster/tmd/internal/twitter"
 )
 
@@ -247,31 +249,6 @@ func TestTweetDumper_Dump_FileContent(t *testing.T) {
 		t.Errorf("Expected tweet ID 12345, got %d", data["1"][0].Id)
 	}
 }
-
-func TestTweetDumper_GetTotal(t *testing.T) {
-	// This test requires a database connection
-	// We'll test the basic structure without DB
-	dumper := NewDumper()
-
-	tweets := []*twitter.Tweet{
-		{Id: 1, Text: "tweet 1", CreatedAt: time.Now()},
-		{Id: 2, Text: "tweet 2", CreatedAt: time.Now()},
-	}
-
-	dumper.Push(1, tweets...)
-
-	// GetTotal requires a database, so we just verify it doesn't panic
-	// with a nil DB (it will return an error or panic depending on implementation)
-	defer func() {
-		if r := recover(); r != nil {
-			// Expected panic with nil DB
-		}
-	}()
-
-	// This will fail because we don't have a real DB, but that's expected
-	_, _ = dumper.GetTotal((*sqlx.DB)(nil))
-}
-
 func TestTweetDumper_MultipleEntities(t *testing.T) {
 	dumper := NewDumper()
 
@@ -662,4 +639,27 @@ func TestJsonDumper_DumpLoadRoundTrip_WithDirs(t *testing.T) {
 			t.Errorf("tweet %d has empty Dir after Load", pt.GetTweet().Id)
 		}
 	}
+}
+
+// 实体被删除后，它的失败记录不能让“全部重试”整批失败：应丢弃并继续。
+func TestDumperGetTotalDropsMissingEntities(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	require.NoError(t, database.CreateUser(db, &database.User{Id: 1, ScreenName: "u1", Name: "U1", IsAccessible: true}))
+	entity := &database.UserEntity{UserId: 1, Name: "media", ParentDir: t.TempDir()}
+	require.NoError(t, database.CreateUserEntity(db, entity))
+	existingID := int(entity.Id.Int32)
+
+	dumper := NewDumper()
+	dumper.Push(existingID, &twitter.Tweet{Id: 100})
+	dumper.Push(999999, &twitter.Tweet{Id: 200}) // 实体不存在
+	require.Equal(t, 2, dumper.Count())
+
+	items, err := dumper.GetTotal(db)
+
+	require.NoError(t, err)
+	assert.Len(t, items, 1)
+	assert.Equal(t, uint64(100), items[0].Tweet.Id)
+	assert.Equal(t, 1, dumper.Count(), "缺失实体的失败记录应被丢弃")
 }

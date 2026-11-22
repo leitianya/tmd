@@ -6,8 +6,11 @@ import (
 	"sync"
 	"time"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/unkmonster/tmd/internal/consolelog"
 )
+
+const botLogResubscribeDelay = 100 * time.Millisecond
 
 // RunBotEventLoop 启动事件订阅协程：监听 EventBus，筛选 "tasks" 事件并回调。
 // 所有 bot 平台的 handleEvents() 均替换为此函数。
@@ -34,35 +37,56 @@ func RunBotEventLoop(eb *EventBus, stopCh <-chan struct{}, wg *sync.WaitGroup, f
 	}()
 }
 
-// RunBotLogLoop 启动日志订阅协程：监听 LogHub，筛选 error/fatal 级别日志，
+// RunBotLogLoop 启动日志订阅协程：监听 LogHub，筛选 ERRO/FATA 级别日志，
 // 以 1 秒速率限制回调。所有 bot 平台的 handleLogs() 均替换为此函数。
 func RunBotLogLoop(lh *consolelog.Hub, stopCh <-chan struct{}, wg *sync.WaitGroup, fn func(line string)) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ch, unsub := lh.Subscribe()
-		defer unsub()
 		var lastLog time.Time
 		for {
+			ch, unsubscribe := lh.Subscribe()
+			closedUnexpectedly := false
+			for !closedUnexpectedly {
+				select {
+				case <-stopCh:
+					unsubscribe()
+					return
+				case line, ok := <-ch:
+					if !ok {
+						closedUnexpectedly = true
+						continue
+					}
+					if !isBotAlertLogLine(line) {
+						continue
+					}
+					now := time.Now()
+					if now.Sub(lastLog) < time.Second {
+						continue
+					}
+					lastLog = now
+					fn(line)
+				}
+			}
+			unsubscribe()
+			if lh.Closed() {
+				return
+			}
+			log.Warn("[bot] Log alert subscription overflowed; resubscribing")
+			timer := time.NewTimer(botLogResubscribeDelay)
 			select {
 			case <-stopCh:
+				timer.Stop()
 				return
-			case line, ok := <-ch:
-				if !ok {
-					return
-				}
-				if !strings.Contains(line, "level=error") && !strings.Contains(line, "level=fatal") {
-					continue
-				}
-				now := time.Now()
-				if now.Sub(lastLog) < time.Second {
-					continue
-				}
-				lastLog = now
-				fn(line)
+			case <-timer.C:
 			}
 		}
 	}()
+}
+
+func isBotAlertLogLine(line string) bool {
+	return strings.HasPrefix(line, "ERRO[") ||
+		strings.HasPrefix(line, "FATA[")
 }
 
 // FormatTaskResult 格式化任务结果描述。

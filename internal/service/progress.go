@@ -3,6 +3,8 @@ package service
 import (
 	"fmt"
 	"strings"
+
+	"github.com/unkmonster/tmd/internal/logging"
 )
 
 // Progress 下载进度
@@ -22,16 +24,18 @@ type MainResult struct {
 
 // ProfileResult 资料下载结果
 type ProfileResult struct {
-	Downloaded int
-	Failed     int
-	Versioned  int // 版本化（旧文件已备份到 .versions）
+	Downloaded    int
+	Failed        int
+	Versioned     int      // 版本化（旧文件已备份到 .versions）
+	FailedDetails []string // 失败用户与原因，供任务结果展示
 }
 
 // Result 执行结果
 type Result struct {
-	Main    *MainResult
-	Profile *ProfileResult
-	Message string
+	Main          *MainResult
+	Profile       *ProfileResult
+	Message       string
+	FailedDetails []string // 失败明细（最多 50 条由 API 层截断）
 }
 
 // ProgressReporter 进度报告接口
@@ -64,25 +68,19 @@ func (l *LogReporter) OnProgress(taskID string, p Progress) {
 	if l.logger == nil {
 		return
 	}
-	// downloading 和 profile 阶段进度频繁，不输出日志避免刷屏
-	if p.Stage == "downloading" || p.Stage == "profile" {
+	// downloading、retrying 和 profile 阶段进度频繁，不输出日志避免刷屏
+	if p.Stage == "downloading" || p.Stage == "retrying" || p.Stage == "profile" {
 		return
 	}
 	switch p.Stage {
 	case "syncing":
-		l.logger("[%s] Syncing: %s", taskID, p.Current)
-	case "retrying":
-		if p.Total > 0 {
-			l.logger("[%s] Retrying failed tweets (%d/%d, Failedtweet=%d)", taskID, p.Completed, p.Total, p.Failed)
-		} else {
-			l.logger("[%s] Retrying failed tweets...", taskID)
-		}
+		l.logger("[task] Progress stage=syncing current=%q", p.Current)
 	case "marking":
-		l.logger("[%s] Marking: %s", taskID, p.Current)
+		l.logger("[task] Progress stage=marking current=%q", p.Current)
 	case "preparing":
-		l.logger("[%s] Preparing...", taskID)
+		l.logger("[task] Progress stage=preparing")
 	default:
-		l.logger("[%s] %s: %s", taskID, p.Stage, p.Current)
+		l.logger("[task] Progress stage=%s current=%q", p.Stage, p.Current)
 	}
 }
 
@@ -99,17 +97,21 @@ func (l *LogReporter) OnComplete(taskID string, r Result) {
 		parts = append(parts, formatProfileResult(*r.Profile))
 	}
 	if len(parts) > 0 {
-		l.logger("[%s] Completed (%s)", taskID, strings.Join(parts, ", "))
+		l.logger("[task] Result summary=%q", strings.Join(parts, ", "))
 		return
 	}
-	l.logger("[%s] Completed: %s", taskID, r.Message)
+	l.logger("[task] Result message=%q", r.Message)
 }
 
 func (l *LogReporter) OnError(taskID string, err error) {
 	if l.logger == nil {
 		return
 	}
-	l.logger("[%s] Error: %v", taskID, err)
+	message := "<nil>"
+	if err != nil {
+		message = logging.RedactSensitiveText(err.Error())
+	}
+	l.logger("[task] Failed task_id=%s error=%q", taskID, message)
 }
 
 func formatMainResult(r MainResult) string {

@@ -2,7 +2,9 @@ package api
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"strconv"
 	"strings"
@@ -10,10 +12,16 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"github.com/unkmonster/tmd/internal/database"
+	entitypkg "github.com/unkmonster/tmd/internal/entity"
+	"github.com/unkmonster/tmd/internal/logging"
 	"github.com/unkmonster/tmd/internal/utils"
 )
 
 // ============ 排序字段白名单 ============
+
+// entityDeleteBatchSize 是级联删除时每轮查询实体数（query-until-empty
+// 循环的批大小，避免 count+1 守卫的并发竞态）。
+const entityDeleteBatchSize = 100
 
 var userSortFields = map[string]string{
 	"id":            "id",
@@ -69,6 +77,14 @@ func optionalUint64Query(r *http.Request, name string) (uint64, bool, error) {
 		return 0, false, fmt.Errorf("invalid %s", name)
 	}
 	return value, true, nil
+}
+
+func logDBInvalidInput(field, value string, err error) {
+	if err == nil {
+		log.Debugf("[db] Invalid input field=%s value=%q", field, value)
+		return
+	}
+	log.Debugf("[db] Invalid input field=%s value=%q error=%q", field, value, err.Error())
 }
 
 // ============ Users 管理 ============
@@ -159,32 +175,39 @@ func (s *Server) handleDBUserUpdate(w http.ResponseWriter, r *http.Request) {
 	if !requireResource(user, err, "User", func(c int, m string) { s.writeError(w, c, m) }) {
 		return
 	}
+	changes := make(map[string]interface{}, 5)
 	if req.ScreenName != nil {
 		if err := validateScreenName(*req.ScreenName); err != nil {
-			log.Debugf("[db] Invalid screen_name: %v", err)
+			logDBInvalidInput("screen_name", *req.ScreenName, err)
 			s.writeErrorDetail(w, http.StatusBadRequest, "Invalid screen name", err.Error())
 			return
 		}
 		user.ScreenName = *req.ScreenName
+		changes["screen_name"] = *req.ScreenName
 	}
 	if req.Name != nil {
 		if err := validateFieldName(*req.Name); err != nil {
-			log.Debugf("[db] Invalid name: %v", err)
+			logDBInvalidInput("name", *req.Name, err)
 			s.writeErrorDetail(w, http.StatusBadRequest, "Invalid name", err.Error())
 			return
 		}
 		user.Name = *req.Name
+		changes["name"] = *req.Name
 	}
 	if req.FriendsCount != nil {
 		user.FriendsCount = *req.FriendsCount
+		changes["friends_count"] = *req.FriendsCount
 	}
 	if req.IsProtected != nil {
 		user.IsProtected = *req.IsProtected
+		changes["protected"] = *req.IsProtected
 	}
 	if req.IsAccessible != nil {
 		user.IsAccessible = *req.IsAccessible
+		changes["is_accessible"] = *req.IsAccessible
 	}
-	if err := database.UpdateUser(s.db, user); err != nil {
+	// 只写显式提供的列：整行写回会与下载中的 SyncUser 并发互相覆盖。
+	if err := database.UpdateUserFields(s.db, id, changes); err != nil {
 		s.dbWriteError(w, err, "UpdateUser")
 		return
 	}
@@ -203,7 +226,43 @@ func (s *Server) handleDBUserDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cascade := s.countUserCascade(id)
+	// 级联计数失败必须拒绝整个删除（fail-closed）：若返回 0 继续，则只删
+	// 一条实体、DelUser 事务删剩余行，留下无 journal 的孤儿媒体目录。
+	cascade, err := s.countUserCascade(id)
+	if err != nil {
+		s.dbWriteError(w, err, "CountUserCascade")
+		return
+	}
+
+	// 先按实体生命周期（staged removal + journal）删除用户实体目录，
+	// 再删用户行；否则 DelUser 直删行会留下无 journal 的孤儿媒体目录。
+	// 循环查询直到无剩余实体：不依赖 count 精度（并发新建实体可能超过
+	// count+1 守卫），确保全部实体走 staged removal 而不是被 DelUser
+	// 事务直接删行。
+	for {
+		entities, err := database.QueryUserEntities(s.db, "user_id = ?", []interface{}{id}, "", entityDeleteBatchSize, 0)
+		if err != nil {
+			s.dbWriteError(w, err, "QueryUserEntities")
+			return
+		}
+		if len(entities) == 0 {
+			break
+		}
+		for i := range entities {
+			managed := entitypkg.NewUserEntityFromRecord(s.db, &entities[i])
+			if err := managed.Remove(); err != nil {
+				s.writeEntityMutationError(w, err, "Entity", "Entity directory already exists", "RemoveUserEntity")
+				return
+			}
+		}
+	}
+
+	// 链接文件在列表目录里，只删 user_links 行会留下无法追踪的孤儿链接。
+	// 先清理磁盘再删行；任一文件删不掉（被占用）就中止，保持行与文件一致。
+	if _, err := s.removeUserLinkFiles(id); err != nil {
+		s.writeEntityMutationError(w, err, "User link", "", "RemoveUserLinkFiles")
+		return
+	}
 
 	if err := database.DelUser(s.db, id); err != nil {
 		s.dbWriteError(w, err, "DelUser")
@@ -235,7 +294,7 @@ func (s *Server) handleDBLists(w http.ResponseWriter, r *http.Request) {
 	if ownerID := r.URL.Query().Get("ownerId"); ownerID != "" {
 		ownerUID, err := strconv.ParseUint(ownerID, 10, 64)
 		if err != nil {
-			log.Debugf("[db] Invalid owner ID: %v", err)
+			logDBInvalidInput("ownerId", ownerID, err)
 			s.writeError(w, http.StatusBadRequest, "Invalid owner ID")
 			return
 		}
@@ -301,7 +360,7 @@ func (s *Server) handleDBListUpdate(w http.ResponseWriter, r *http.Request) {
 
 	if req.Name != nil {
 		if err := validateFieldName(*req.Name); err != nil {
-			log.Debugf("[db] Invalid name: %v", err)
+			logDBInvalidInput("name", *req.Name, err)
 			s.writeErrorDetail(w, http.StatusBadRequest, "Invalid name", err.Error())
 			return
 		}
@@ -310,7 +369,7 @@ func (s *Server) handleDBListUpdate(w http.ResponseWriter, r *http.Request) {
 	if req.OwnerID != nil {
 		ownerID, err := strconv.ParseUint(*req.OwnerID, 10, 64)
 		if err != nil {
-			log.Debugf("[db] Invalid owner ID: %v", err)
+			logDBInvalidInput("owner_user_id", *req.OwnerID, err)
 			s.writeError(w, http.StatusBadRequest, "Invalid owner ID")
 			return
 		}
@@ -336,6 +395,28 @@ func (s *Server) handleDBListDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 先按实体生命周期（staged removal + journal）删除列表实体目录；
+	// DelLst 的事务级联只删行，会留下无 journal 的孤儿媒体目录。
+	// 循环查询直到无剩余实体：不依赖 count 精度，确保全部实体走
+	// staged removal 而不是被 DelLst 事务直接删行。
+	for {
+		listEntities, err := database.QueryLstEntities(s.db, "lst_id = ?", []interface{}{id}, "", entityDeleteBatchSize, 0)
+		if err != nil {
+			s.dbWriteError(w, err, "QueryLstEntities")
+			return
+		}
+		if len(listEntities) == 0 {
+			break
+		}
+		for i := range listEntities {
+			managed := entitypkg.NewListEntityFromRecord(s.db, &listEntities[i])
+			if err := managed.Remove(); err != nil {
+				s.writeEntityMutationError(w, err, "List entity", "List entity directory already exists", "RemoveListEntity")
+				return
+			}
+		}
+	}
+
 	if err := database.DelLst(s.db, id); err != nil {
 		s.dbWriteError(w, err, "DelLst")
 		return
@@ -359,7 +440,7 @@ func (s *Server) handleDBUserEntities(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if userID, ok, err := optionalUint64Query(r, "userId"); err != nil {
-		log.Debugf("[db] Invalid user ID: %v", err)
+		logDBInvalidInput("userId", r.URL.Query().Get("userId"), err)
 		s.writeError(w, http.StatusBadRequest, "Invalid user ID")
 		return
 	} else if ok {
@@ -432,38 +513,64 @@ func (s *Server) handleDBUserEntityUpdate(w http.ResponseWriter, r *http.Request
 
 	if req.Name != nil {
 		if err := validateFieldName(*req.Name); err != nil {
-			log.Debugf("[db] Invalid name: %v", err)
+			logDBInvalidInput("name", *req.Name, err)
 			s.writeErrorDetail(w, http.StatusBadRequest, "Invalid name", err.Error())
 			return
 		}
-		entity.Name = *req.Name
-	}
-	if req.MediaCount != nil {
-		entity.MediaCount = sql.NullInt32{Int32: *req.MediaCount, Valid: true}
-	}
-	if req.LatestReleaseTime != nil {
-		if *req.LatestReleaseTime == "" {
-			if err := database.ClearUserEntityLatestReleaseTime(s.db, int(id)); err != nil {
-				s.dbWriteError(w, err, "ClearUserEntityLatestReleaseTime")
-				return
-			}
-		} else {
-			t, err := time.Parse(time.RFC3339, *req.LatestReleaseTime)
-			if err != nil {
-				log.Debugf("[db] Invalid latest_release_time: %v", err)
-				s.writeError(w, http.StatusBadRequest, "Invalid latest_release_time format, use RFC 3339 (e.g. 2024-12-18T15:30:00Z)")
-				return
-			}
-			if err := database.SetUserEntityLatestReleaseTime(s.db, int(id), t); err != nil {
-				s.dbWriteError(w, err, "SetUserEntityLatestReleaseTime")
-				return
-			}
+		if err := entitypkg.ValidateName(*req.Name); err != nil {
+			logDBInvalidInput("name", *req.Name, err)
+			s.writeErrorDetail(w, http.StatusBadRequest, "Invalid name", err.Error())
+			return
 		}
 	}
 
-	if err := database.UpdateUserEntityFields(s.db, int(id), entity.Name, entity.MediaCount); err != nil {
-		s.dbWriteError(w, err, "UpdateUserEntityFields")
-		return
+	var parsedReleaseTime *time.Time
+	if req.LatestReleaseTime != nil && *req.LatestReleaseTime != "" {
+		value, err := time.Parse(time.RFC3339, *req.LatestReleaseTime)
+		if err != nil {
+			logDBInvalidInput("latest_release_time", *req.LatestReleaseTime, err)
+			s.writeError(w, http.StatusBadRequest, "Invalid latest_release_time format, use RFC 3339 (e.g. 2024-12-18T15:30:00Z)")
+			return
+		}
+		parsedReleaseTime = &value
+	}
+
+	var latestReleaseTime *sql.NullTime
+	if req.LatestReleaseTime != nil {
+		latestReleaseTime = &sql.NullTime{}
+		if *req.LatestReleaseTime != "" {
+			latestReleaseTime.Time = *parsedReleaseTime
+			latestReleaseTime.Valid = true
+		}
+	}
+	if req.MediaCount != nil || latestReleaseTime != nil {
+		if err := database.UpdateUserEntityMetadata(s.db, int(id), req.MediaCount, latestReleaseTime); err != nil {
+			s.writeEntityMutationError(w, err, "Entity", "Entity directory already exists", "UpdateUserEntityMetadata")
+			return
+		}
+		if req.MediaCount != nil {
+			entity.MediaCount = sql.NullInt32{Int32: *req.MediaCount, Valid: true}
+		}
+		if latestReleaseTime != nil {
+			entity.LatestReleaseTime = *latestReleaseTime
+		}
+	}
+
+	metadataUpdated := req.MediaCount != nil || latestReleaseTime != nil
+
+	managedEntity := entitypkg.NewUserEntityFromRecord(s.db, entity)
+	if req.Name != nil {
+		if err := managedEntity.Rename(*req.Name); err != nil {
+			if metadataUpdated {
+				// 统计字段（media_count/latest_release_time）已先行提交；
+				// 明确告知客户端避免误判为全部未生效。重试是幂等的。
+				s.writeEntityMutationErrorWithDetail(w, err, "Entity", "Entity directory already exists",
+					"RenameUserEntity", "statistics were saved but the name change was rejected")
+				return
+			}
+			s.writeEntityMutationError(w, err, "Entity", "Entity directory already exists", "RenameUserEntity")
+			return
+		}
 	}
 
 	s.writeResourceJSON(w, dbEntityToItem(entity))
@@ -480,12 +587,53 @@ func (s *Server) handleDBUserEntityDelete(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := database.DelUserEntity(s.db, uint32(id)); err != nil {
-		s.dbWriteError(w, err, "DelUserEntity")
+	managedEntity := entitypkg.NewUserEntityFromRecord(s.db, entity)
+	if err := managedEntity.Remove(); err != nil {
+		s.writeEntityMutationError(w, err, "Entity", "Entity directory already exists", "RemoveUserEntity")
 		return
 	}
 
 	s.writeResourceDeleted(w, "Entity")
+}
+
+func (s *Server) writeEntityMutationError(w http.ResponseWriter, err error, resource, pathConflictMessage, operation string) {
+	s.writeEntityMutationErrorWithDetail(w, err, resource, pathConflictMessage, operation, "")
+}
+
+// writeEntityMutationErrorWithDetail 与 writeEntityMutationError 相同，但允许
+// 附加一条用户安全的提示（例如"统计字段已保存但改名被拒绝"）。detail 只
+// 拼进 409 的用户文案，不包含原始错误。
+func (s *Server) writeEntityMutationErrorWithDetail(w http.ResponseWriter, err error, resource, pathConflictMessage, operation, detail string) {
+	// 统一哨兵：直连 database 的调用点（如 UpdateUserEntityMetadata）返回
+	// database.ErrEntityNotFound，与 entity 层错误在此一并翻译，switch 只需
+	// 匹配 entity.ErrNotFound。TranslateError 幂等，entity 层错误原样通过。
+	err = entitypkg.TranslateError(err)
+	switch {
+	case errors.Is(err, entitypkg.ErrNotFound):
+		s.writeError(w, http.StatusNotFound, resource+" not found")
+	case errors.Is(err, entitypkg.ErrPathConflict):
+		message := pathConflictMessage
+		if detail != "" {
+			message += "; " + detail
+		}
+		s.writeErrorDetail(w, http.StatusConflict, message, err.Error())
+	case errors.Is(err, entitypkg.ErrConcurrentUpdate):
+		message := resource + " changed concurrently"
+		if detail != "" {
+			message += "; " + detail
+		}
+		s.writeErrorDetail(w, http.StatusConflict, message, err.Error())
+	case errors.Is(err, fs.ErrPermission):
+		// 目录或其中的文件被其它程序占用、只读或权限不足：这是可重试的
+		// 客户端状态，不是服务端故障，给出可行动文案。
+		message := resource + " directory is in use, read-only, or not writable"
+		if detail != "" {
+			message += "; " + detail
+		}
+		s.writeErrorDetail(w, http.StatusConflict, message, err.Error())
+	default:
+		s.dbWriteError(w, err, operation)
+	}
 }
 
 // batchLoadNames 批量加载指定表的 id→name 映射，返回 map[int64]string。
@@ -511,7 +659,7 @@ func (s *Server) batchLoadNames(table, idCol, nameCol string, ids []interface{})
 		}
 	}
 	if err := rows.Err(); err != nil {
-		log.Warnf("[db] batchLoadNames iteration failed: %v", err)
+		log.Warnf("[db] Batch name load failed table=%s error=%q", table, err.Error())
 	}
 	return names
 }
@@ -531,7 +679,7 @@ func (s *Server) handleDBListEntities(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if listID, ok, err := optionalUint64Query(r, "listId"); err != nil {
-		log.Debugf("[db] Invalid list ID: %v", err)
+		logDBInvalidInput("listId", r.URL.Query().Get("listId"), err)
 		s.writeError(w, http.StatusBadRequest, "Invalid list ID")
 		return
 	} else if ok {
@@ -609,16 +757,20 @@ func (s *Server) handleDBListEntityUpdate(w http.ResponseWriter, r *http.Request
 
 	if req.Name != nil {
 		if err := validateFieldName(*req.Name); err != nil {
-			log.Debugf("[db] Invalid name: %v", err)
+			logDBInvalidInput("name", *req.Name, err)
 			s.writeErrorDetail(w, http.StatusBadRequest, "Invalid name", err.Error())
 			return
 		}
-		entity.Name = *req.Name
-	}
-
-	if err := database.UpdateLstEntity(s.db, entity); err != nil {
-		s.dbWriteError(w, err, "UpdateLstEntity")
-		return
+		if err := entitypkg.ValidateName(*req.Name); err != nil {
+			logDBInvalidInput("name", *req.Name, err)
+			s.writeErrorDetail(w, http.StatusBadRequest, "Invalid name", err.Error())
+			return
+		}
+		managedEntity := entitypkg.NewListEntityFromRecord(s.db, entity)
+		if err := managedEntity.Rename(*req.Name); err != nil {
+			s.writeEntityMutationError(w, err, "List entity", "List entity directory already exists", "RenameListEntity")
+			return
+		}
 	}
 
 	lstName := s.getListName(uint64(entity.LstId))
@@ -637,8 +789,9 @@ func (s *Server) handleDBListEntityDelete(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := database.DelLstEntity(s.db, int(id)); err != nil {
-		s.dbWriteError(w, err, "DelLstEntity")
+	managedEntity := entitypkg.NewListEntityFromRecord(s.db, entity)
+	if err := managedEntity.Remove(); err != nil {
+		s.writeEntityMutationError(w, err, "List entity", "List entity directory already exists", "RemoveListEntity")
 		return
 	}
 
@@ -654,7 +807,7 @@ func (s *Server) handleDBUserLinks(w http.ResponseWriter, r *http.Request) {
 	var args []interface{}
 
 	if userID, ok, err := optionalUint64Query(r, "userId"); err != nil {
-		log.Debugf("[db] Invalid user ID: %v", err)
+		logDBInvalidInput("userId", r.URL.Query().Get("userId"), err)
 		s.writeError(w, http.StatusBadRequest, "Invalid user ID")
 		return
 	} else if ok {
@@ -663,7 +816,7 @@ func (s *Server) handleDBUserLinks(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if listEntityID, ok, err := optionalUint64Query(r, "listEntityId"); err != nil {
-		log.Debugf("[db] Invalid list entity ID: %v", err)
+		logDBInvalidInput("listEntityId", r.URL.Query().Get("listEntityId"), err)
 		s.writeError(w, http.StatusBadRequest, "Invalid list entity ID")
 		return
 	} else if ok {
@@ -745,11 +898,31 @@ func (s *Server) handleDBUserLinkUpdate(w http.ResponseWriter, r *http.Request) 
 
 	if req.Name != nil {
 		if err := validateFieldName(*req.Name); err != nil {
-			log.Errorf("[db] Invalid name: %v", err)
+			logDBInvalidInput("name", *req.Name, err)
 			s.writeErrorDetail(w, http.StatusBadRequest, "Invalid name", err.Error())
 			return
 		}
-		link.Name = *req.Name
+		if *req.Name != link.Name {
+			oldPath := userLinkPath(s.db, link)
+			candidate := &database.UserLink{Name: *req.Name, ParentLstEntityId: link.ParentLstEntityId}
+			newPath := userLinkPath(s.db, candidate)
+			moved, moveErr := renameUserLinkFile(oldPath, newPath)
+			if moveErr != nil {
+				s.writeEntityMutationError(w, moveErr, "User link", "", "RenameUserLinkFile")
+				return
+			}
+			if err := database.UpdateUserLink(s.db, link.Id, *req.Name); err != nil {
+				// 数据库失败时把文件移回原位，保持 DB 与磁盘一致。
+				if moved {
+					if _, rollbackErr := renameUserLinkFile(newPath, oldPath); rollbackErr != nil {
+						log.Errorf("[api] User link rename rollback failed path=%q error=%q", logging.Path(newPath), rollbackErr.Error())
+					}
+				}
+				s.dbWriteError(w, err, "UpdateUserLink")
+				return
+			}
+			link.Name = *req.Name
+		}
 	}
 
 	if err := database.UpdateUserLink(s.db, link.Id, link.Name); err != nil {
@@ -771,6 +944,14 @@ func (s *Server) handleDBUserLinkDelete(w http.ResponseWriter, r *http.Request) 
 	link, err := database.GetUserLinkById(s.db, int32(id))
 	if !requireResource(link, err, "User link", func(c int, m string) { s.writeError(w, c, m) }) {
 		return
+	}
+
+	// 先删磁盘链接再删行：删文件失败（被占用/无权限）就保留行，避免孤儿文件。
+	if path := userLinkPath(s.db, link); path != "" {
+		if err := removeUserLinkFile(path); err != nil {
+			s.writeEntityMutationError(w, err, "User link", "", "RemoveUserLinkFile")
+			return
+		}
 	}
 
 	if err := database.DelUserLink(s.db, int32(id)); err != nil {
@@ -938,7 +1119,7 @@ func (s *Server) handleDBStats(w http.ResponseWriter, _ *http.Request) {
 	for _, t := range tables {
 		count, err := database.Count(s.db, t.Name, nil)
 		if err != nil {
-			log.Errorf("[db] Failed to count %s: %v", t.Name, err)
+			log.Errorf("[db] Count failed table=%s error=%q", t.Name, err.Error())
 			s.writeError(w, http.StatusInternalServerError, "Database query failed")
 			return
 		}
@@ -958,7 +1139,7 @@ func (s *Server) handleDBPreviousNames(w http.ResponseWriter, r *http.Request) {
 
 	// 可选：按 user_id 筛选
 	if userID, ok, err := optionalUint64Query(r, "userId"); err != nil {
-		log.Debugf("[db] Invalid user ID: %v", err)
+		logDBInvalidInput("userId", r.URL.Query().Get("userId"), err)
 		s.writeError(w, http.StatusBadRequest, "Invalid user ID")
 		return
 	} else if ok {
@@ -972,8 +1153,12 @@ func (s *Server) handleDBPreviousNames(w http.ResponseWriter, r *http.Request) {
 			[]string{"pn.screen_name", "pn.name", "u.screen_name"},
 			keyword,
 		)
-		whereConditions = append(whereConditions, cond)
-		args = append(args, searchArgs...)
+		// 纵深防御：BuildSearchCondition 对非法字段静默跳过，若字段列表
+		// 将来混入非法标识符，cond 为空时必须跳过拼接，避免悬空 AND。
+		if cond != "" {
+			whereConditions = append(whereConditions, cond)
+			args = append(args, searchArgs...)
+		}
 	}
 
 	// 基础条件：只统计有多条记录的用户（实际改过名的）

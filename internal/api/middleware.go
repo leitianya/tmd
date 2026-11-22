@@ -2,13 +2,13 @@ package api
 
 import (
 	"bufio"
-	"encoding/json"
 	"net"
 	"net/http"
 	"strings"
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	"github.com/unkmonster/tmd/internal/logging"
 )
 
 // responseRecorder 包装 http.ResponseWriter 以记录状态码
@@ -57,8 +57,20 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		start := time.Now()
 		rr := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(rr, r)
-		log.Infof("[%s] %s %s %d (%v)", r.Method, r.URL.Path, r.RemoteAddr, rr.statusCode, time.Since(start))
+		log.StandardLogger().Logf(apiAccessLogLevel(r.Method, rr.statusCode), "[api] %s %s status=%d dur=%s ip=%s", r.Method, logging.RequestTarget(r), rr.statusCode, time.Since(start), clientIP(r.RemoteAddr))
 	})
+}
+
+func apiAccessLogLevel(method string, statusCode int) log.Level {
+	if statusCode >= http.StatusBadRequest {
+		return log.WarnLevel
+	}
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return log.DebugLevel
+	default:
+		return log.InfoLevel
+	}
 }
 
 // securityHeadersMiddleware 安全响应头中间件
@@ -79,7 +91,8 @@ const authBearerPrefix = "Bearer "
 var publicPathPrefixes = []string{
 	"/api/v1/health",
 	"/api/v1/auth/login",   // login 端点需要在没有 JWT 时也能被调用
-	"/api/v1/config/theme", // theme 切换器由内联 JS 调用，不经过 api 对象
+	"/api/v1/config/theme",       // theme 切换器由内联 JS 调用，不经过 api 对象
+	"/api/v1/download/context",   // 下载页首屏就绪状态：未登录时也需要拿认证开关
 	"/static/",
 }
 
@@ -130,6 +143,14 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// 已注册的 bot 回调精确路径免认证（Feishu 等第三方平台不带 TMD
+		// Bearer，回调自身用 verify_token/encrypt_key 校验事件）。只放行
+		// 实际注册的路径，不放行宽泛 /api/v1/bot/ 前缀。
+		if _, registered := s.botCallbackPaths[r.URL.Path]; registered {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		// 读取当前配置中的 API Key
 		s.configMu.RLock()
 		apiKey := s.config.APIKey
@@ -149,7 +170,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		}
 
 		if token == "" {
-			log.Debugf("[auth] Missing token for %s %s", r.Method, r.URL.Path)
+			log.Debugf("[auth] Token missing method=%s path=%q", r.Method, r.URL.Path)
 			writeAuth401(w, "missing")
 			return
 		}
@@ -162,7 +183,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 				next.ServeHTTP(w, r)
 				return
 			}
-			log.Debugf("[auth] Invalid token on management path %s", r.URL.Path)
+			log.Debugf("[auth] Management token invalid path=%q", r.URL.Path)
 			writeAuth401(w, "invalid")
 			return
 		}
@@ -195,7 +216,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		} else {
 			w.Header().Set("X-Token-Type", "invalid")
 		}
-		log.Debugf("[auth] Authentication failed for %s %s: X-Token-Type=%s", r.Method, r.URL.Path, w.Header().Get("X-Token-Type"))
+		log.Debugf("[auth] Authentication failed method=%s path=%q token_type=%s", r.Method, r.URL.Path, w.Header().Get("X-Token-Type"))
 		writeAuth401(w, "invalid")
 	})
 }
@@ -207,15 +228,9 @@ func isAuthManagementPath(path string) bool {
 
 // writeAuth401 writes a standard 401 Unauthorized response.
 func writeAuth401(w http.ResponseWriter, tokenType string) {
-	errMsg := "unauthorized"
-	switch tokenType {
-	case "missing":
-		errMsg = "missing authorization token"
-	case "invalid":
-		errMsg = "invalid or expired authorization token"
+	if tokenType != "" && w.Header().Get("X-Token-Type") == "" {
+		w.Header().Set("X-Token-Type", tokenType)
 	}
 	w.Header().Set("WWW-Authenticate", `Bearer realm="TMD API"`)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusUnauthorized)
-	json.NewEncoder(w).Encode(NewErrorResponse(errMsg))
+	writeJSONResponse(w, http.StatusUnauthorized, NewErrorResponse("unauthorized"))
 }

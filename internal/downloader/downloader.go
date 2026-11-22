@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"
+	"github.com/unkmonster/tmd/internal/logging"
 	"github.com/unkmonster/tmd/internal/utils"
 )
 
@@ -48,8 +51,72 @@ func newHTTPStatusError(statusCode int, url string) error {
 	}
 }
 
-func isNonRetriableStatusError(err error) bool {
+// IsNonRetriableStatusError 判断错误是否为不可重试的 HTTP 状态码（403/404）。
+// 403（禁止访问）与 404（资源不存在）重试不会改变结果，调用方应直接跳过
+// 而非进入重试链路。供 downloader 与 downloading 包共用，避免双实现分叉。
+func IsNonRetriableStatusError(err error) bool {
 	return utils.IsStatusCode(err, 403) || utils.IsStatusCode(err, 404)
+}
+
+// logURL 对写入日志的 URL 做脱敏（掩盖敏感查询参数），保证日志可审计且
+// 不泄露 token 等凭据。脱敏实现即 logging.SanitizeURL（logging 包统一出口）。
+func logURL(raw string) string {
+	return logging.SanitizeURL(raw)
+}
+
+func logError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return logging.RedactSensitiveText(err.Error())
+}
+
+type logField struct {
+	key   string
+	value interface{}
+}
+
+func orderedLogFields(req DownloadRequest, fields ...logField) string {
+	parts := make([]string, 0, len(req.LogFields)+len(fields))
+	used := make(map[string]struct{}, len(req.LogFields))
+
+	for _, key := range []string{"tweet_id"} {
+		if value, ok := req.LogFields[key]; ok {
+			parts = append(parts, formatLogField(key, value))
+			used[key] = struct{}{}
+		}
+	}
+
+	keys := make([]string, 0, len(req.LogFields))
+	for key := range req.LogFields {
+		if _, ok := used[key]; !ok {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		parts = append(parts, formatLogField(key, req.LogFields[key]))
+	}
+
+	for _, field := range fields {
+		parts = append(parts, formatLogField(field.key, field.value))
+	}
+
+	if len(parts) == 0 {
+		return ""
+	}
+	return " " + strings.Join(parts, " ")
+}
+
+func formatLogField(key string, value interface{}) string {
+	switch v := value.(type) {
+	case string:
+		return fmt.Sprintf("%s=%q", key, v)
+	case error:
+		return fmt.Sprintf("%s=%q", key, logError(v))
+	default:
+		return fmt.Sprintf("%s=%v", key, v)
+	}
 }
 
 // NewDownloader 创建下载器
@@ -86,27 +153,30 @@ func (d *DefaultDownloader) Download(req DownloadRequest) (*DownloadResult, erro
 	contentLength, err := d.getContentLength(req)
 	if err != nil {
 		// HEAD 失败，回退到 Buffer 模式
-		d.logger.WithFields(log.Fields{
-			"url":   req.URL,
-			"error": err,
-		}).Debug("[downloader] HEAD request failed, fallback to buffer mode")
+		d.logger.Debugf("[downloader] HEAD request failed, fallback to buffer mode%s",
+			orderedLogFields(req,
+				logField{"url", logURL(req.URL)},
+				logField{"error", logError(err)},
+			))
 		return d.downloadBuffer(req)
 	}
 
 	// 2. 根据大小选择策略
 	if contentLength > streamThreshold {
 		// 大文件：流式下载（带重试）
-		d.logger.WithFields(log.Fields{
-			"url":  req.URL,
-			"size": contentLength,
-		}).Debug("[downloader] Using stream mode for large file")
+		d.logger.Debugf("[downloader] Using stream mode for large file%s",
+			orderedLogFields(req,
+				logField{"size", contentLength},
+				logField{"url", logURL(req.URL)},
+			))
 		return d.downloadStream(req, contentLength)
 	} else {
 		// 小文件：Buffer 下载（支持 SkipUnchanged）
-		d.logger.WithFields(log.Fields{
-			"url":  req.URL,
-			"size": contentLength,
-		}).Debug("[downloader] Using buffer mode for small file")
+		d.logger.Debugf("[downloader] Using buffer mode for small file%s",
+			orderedLogFields(req,
+				logField{"size", contentLength},
+				logField{"url", logURL(req.URL)},
+			))
 		return d.downloadBuffer(req)
 	}
 }
@@ -162,10 +232,11 @@ func (d *DefaultDownloader) downloadBuffer(req DownloadRequest) (*DownloadResult
 	if resp.StatusCode() < 200 || resp.StatusCode() >= 300 {
 		err := newHTTPStatusError(resp.StatusCode(), req.URL)
 		result.Error = err
-		d.logger.WithFields(log.Fields{
-			"url":         req.URL,
-			"status_code": resp.StatusCode(),
-		}).Warn("[downloader] Download failed with non-2xx status")
+		d.logger.Warnf("[downloader] Download failed with non-2xx status%s",
+			orderedLogFields(req,
+				logField{"status_code", resp.StatusCode()},
+				logField{"url", logURL(req.URL)},
+			))
 		return result, err
 	}
 
@@ -203,17 +274,18 @@ func (d *DefaultDownloader) downloadStream(req DownloadRequest, contentLength in
 		if err == nil {
 			// 下载成功
 			if attempt > 1 {
-				d.logger.WithFields(log.Fields{
-					"url":     req.URL,
-					"attempt": attempt,
-				}).Info("[downloader] Download succeeded after retry")
+				d.logger.Infof("[downloader] Download succeeded after retry%s",
+					orderedLogFields(req,
+						logField{"attempt", attempt},
+						logField{"url", logURL(req.URL)},
+					))
 			}
 			return result, nil
 		}
 
 		lastErr = err
 
-		if isNonRetriableStatusError(err) {
+		if IsNonRetriableStatusError(err) {
 			return result, err
 		}
 
@@ -221,21 +293,23 @@ func (d *DefaultDownloader) downloadStream(req DownloadRequest, contentLength in
 		if result != nil && result.Error != nil {
 			// 如果是最后一次尝试，回退到 Buffer 模式
 			if attempt == maxDownloadRetries {
-				d.logger.WithFields(log.Fields{
-					"url":        req.URL,
-					"attempts":   maxDownloadRetries,
-					"last_error": err,
-				}).Warn("[downloader] Stream download failed after max retries, fallback to buffer mode")
+				d.logger.Warnf("[downloader] Stream download failed after max retries, fallback to buffer mode%s",
+					orderedLogFields(req,
+						logField{"attempts", maxDownloadRetries},
+						logField{"url", logURL(req.URL)},
+						logField{"last_error", logError(err)},
+					))
 				return d.downloadBuffer(req)
 			}
 
 			// 记录重试日志
-			d.logger.WithFields(log.Fields{
-				"url":         req.URL,
-				"attempt":     attempt,
-				"max_retries": maxDownloadRetries,
-				"error":       err,
-			}).Warn("[downloader] Download failed, retrying...")
+			d.logger.Warnf("[downloader] Download failed, retrying...%s",
+				orderedLogFields(req,
+					logField{"attempt", attempt},
+					logField{"max_retries", maxDownloadRetries},
+					logField{"url", logURL(req.URL)},
+					logField{"error", logError(err)},
+				))
 
 			// 等待一段时间后重试
 			if err := waitRetryDelay(req.Context, retryDelay*time.Duration(attempt)); err != nil {
@@ -279,10 +353,11 @@ func (d *DefaultDownloader) doDownloadStream(req DownloadRequest, contentLength 
 	if resp.StatusCode() < 200 || resp.StatusCode() >= 300 {
 		err := newHTTPStatusError(resp.StatusCode(), req.URL)
 		result.Error = err
-		d.logger.WithFields(log.Fields{
-			"url":         req.URL,
-			"status_code": resp.StatusCode(),
-		}).Warn("[downloader] Stream download failed with non-2xx status")
+		d.logger.Warnf("[downloader] Stream download failed with non-2xx status%s",
+			orderedLogFields(req,
+				logField{"status_code", resp.StatusCode()},
+				logField{"url", logURL(req.URL)},
+			))
 		return result, err
 	}
 
@@ -308,18 +383,20 @@ func (d *DefaultDownloader) doDownloadStream(req DownloadRequest, contentLength 
 		err := fmt.Errorf("file size mismatch: expected %d bytes, got %d bytes", contentLength, writeResult.NewSize)
 		result.Error = err
 		result.Success = false
-		d.logger.WithFields(log.Fields{
-			"url":           req.URL,
-			"expected_size": contentLength,
-			"actual_size":   writeResult.NewSize,
-		}).Warn("[downloader] Download file size mismatch")
+		d.logger.Warnf("[downloader] Download file size mismatch%s",
+			orderedLogFields(req,
+				logField{"expected_size", contentLength},
+				logField{"actual_size", writeResult.NewSize},
+				logField{"url", logURL(req.URL)},
+			))
 
 		// 删除不完整的文件
 		if removeErr := os.Remove(req.Destination); removeErr != nil {
-			d.logger.WithFields(log.Fields{
-				"url":   req.URL,
-				"error": removeErr,
-			}).Warn("[downloader] Failed to remove incomplete file")
+			d.logger.Warnf("[downloader] Incomplete file remove failed%s",
+				orderedLogFields(req,
+					logField{"url", logURL(req.URL)},
+					logField{"error", logError(removeErr)},
+				))
 		}
 
 		return result, err

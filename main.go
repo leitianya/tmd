@@ -2,22 +2,20 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 
 	"github.com/go-resty/resty/v2"
-	"github.com/gookit/color"
 	"github.com/jmoiron/sqlx"
-	"github.com/natefinch/lumberjack"
-	"github.com/unkmonster/tmd/internal/logging"
 	log "github.com/sirupsen/logrus"
+	"github.com/unkmonster/tmd/internal/logging"
 
 	"github.com/unkmonster/tmd/internal/api"
 	"github.com/unkmonster/tmd/internal/bot"
@@ -32,19 +30,16 @@ import (
 	"github.com/unkmonster/tmd/internal/consolelog"
 	"github.com/unkmonster/tmd/internal/database"
 	"github.com/unkmonster/tmd/internal/downloading"
+	"github.com/unkmonster/tmd/internal/entity"
 	"github.com/unkmonster/tmd/internal/path"
 	"github.com/unkmonster/tmd/internal/service"
 	"github.com/unkmonster/tmd/internal/twitter"
-	"github.com/unkmonster/tmd/internal/utils"
 )
 
 func initLogger(dbg bool, logFile io.Writer, logHub *consolelog.Hub) {
-	log.SetFormatter(&log.TextFormatter{
-		ForceColors:    true,
-		FullTimestamp:  true,
-		DisableSorting: true,
-		PadLevelText:   false,
-	})
+	formatter := logging.NewTextFormatter()
+	configureTerminalColors(formatter)
+	log.SetFormatter(formatter)
 
 	if dbg {
 		log.SetLevel(log.DebugLevel)
@@ -53,27 +48,56 @@ func initLogger(dbg bool, logFile io.Writer, logHub *consolelog.Hub) {
 	}
 
 	if err := consolelog.StartCapture(logHub); err != nil {
-		log.Warnf("[startup] Failed to start console log capture: %v", err)
+		log.Warnf("[startup] Console log capture failed error=%q", err.Error())
 	} else {
 		log.SetOutput(os.Stderr)
 	}
 	log.AddHook(logging.NewLumberjackHook(logFile))
 }
 
+func configureTerminalColors(formatter *log.TextFormatter) {
+	noColor := os.Getenv("NO_COLOR") != ""
+	formatter.ForceColors = !noColor
+	formatter.DisableColors = noColor
+}
+
 func main() {
+	if err := run(os.Args[1:]); err != nil {
+		var logged *loggedError
+		if !errors.As(err, &logged) {
+			_, _ = fmt.Fprintln(os.Stderr, err)
+		}
+		os.Exit(1)
+	}
+}
+
+type loggedError struct {
+	err error
+}
+
+func (e *loggedError) Error() string { return e.err.Error() }
+func (e *loggedError) Unwrap() error { return e.err }
+
+func logRunError(err error) error {
+	if err == nil {
+		return nil
+	}
+	log.Errorf("[startup] Process failed error=%q", err.Error())
+	return &loggedError{err: err}
+}
+
+func run(args []string) (runErr error) {
 	var serverPort int
 	var err error
 
-	bootstrap, err := parseBootstrapArgs(os.Args[1:])
+	bootstrap, err := parseBootstrapArgs(args)
 	if err != nil {
-		_, _ = fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
 	if !bootstrap.serverPortSet {
 		serverPort, err = serverPortFromEnv()
 		if err != nil {
-			_, _ = fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			return err
 		}
 	} else {
 		serverPort = bootstrap.serverPort
@@ -83,75 +107,56 @@ func main() {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	appRootPath, err := resolveAppRootPath()
 	if err != nil {
-		_, _ = fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
 
 	confPath := filepath.Join(appRootPath, "conf.yaml")
 	cliLogPath := filepath.Join(appRootPath, "client.log")
 	logPath := filepath.Join(appRootPath, "tmd2.log")
 	if err = os.MkdirAll(appRootPath, 0755); err != nil {
-		log.Fatalln("[startup] Failed to make app dir", err)
+		return fmt.Errorf("[startup] app directory create failed path=%q: %w", logging.Path(appRootPath), err)
 	}
 
-	logWriter := &lumberjack.Logger{
-		Filename:   logPath,
-		MaxSize:    2,
-		MaxBackups: 2,
-		MaxAge:     14,
-		Compress:   true,
-	}
-	cliLogWriter := &lumberjack.Logger{
-		Filename:   cliLogPath,
-		MaxSize:    2,
-		MaxBackups: 2,
-		MaxAge:     14,
-		Compress:   true,
-	}
+	logWriter := logging.NewRotatingWriter(logPath)
+	cliLogWriter := logging.NewRotatingWriter(cliLogPath)
 	defer cliLogWriter.Close()
 	defer logWriter.Close()
 	consoleLogHub := consolelog.DefaultHub()
 	initLogger(bootstrap.dbg, logWriter, consoleLogHub)
+	defer consolelog.StopCapture()
 
 	defer func() {
 		if bootstrap.dbg {
 			twitter.ReportRequestCount()
 		}
 	}()
+	defer func() {
+		runErr = logRunError(runErr)
+	}()
 
 	loadResult, err := config.LoadStartupConfig(confPath, bootstrap.confArg, os.Stderr)
 	if err != nil {
-		log.Fatalln("[startup] Config failure with", err)
+		return fmt.Errorf("[startup] config load failed path=%q: %w", logging.Path(confPath), err)
 	}
 	conf := loadResult.Config
 	if loadResult.UsedEnvFallback {
-		log.Infoln("Config file not found, using TMD_* environment configuration")
+		log.Infof("[config] Env fallback used path=%q", logging.Path(confPath))
 	}
 	if loadResult.EnvApplied {
-		log.Infoln("TMD_* environment configuration applied")
+		log.Info("[config] Env configuration applied prefix=TMD_")
 	}
 	if bootstrap.confArg {
-		log.Infoln("[config] Config done")
-		return
+		log.Info("[config] Config template written")
+		return nil
 	}
 	if err := config.Validate(conf); err != nil {
-		log.Fatalln("[startup] Invalid config:", err)
+		return fmt.Errorf("[startup] config validation failed path=%q: %w", logging.Path(confPath), err)
 	}
-	log.Infoln("[startup] Config is loaded")
-	log.Infoln("[startup] Download path:", conf.RootPath)
-	maxDownloadRoutine := conf.MaxDownloadRoutine
-	if maxDownloadRoutine <= 0 {
-		maxDownloadRoutine = config.DefaultMaxDownloadRoutine()
-	}
-	log.Infoln("[startup] Max download routine set to:", maxDownloadRoutine)
-	maxFileNameLen := conf.MaxFileNameLen
-	if maxFileNameLen <= 0 {
-		maxFileNameLen = utils.DefaultMaxFileNameLen
-	}
-	log.Infoln("[startup] Max file name length set to:", maxFileNameLen)
+	log.Infof("[startup] Config loaded root=%q", logging.Path(conf.RootPath))
 
 	if conf.ProxyURL != "" {
 		os.Setenv("HTTP_PROXY", conf.ProxyURL)
@@ -180,14 +185,13 @@ func main() {
 
 	// Server 模式
 	if bootstrap.serverMode {
-		runServer(conf, appRootPath, serverPort, loginOpts, logWriter, consoleLogHub, cliLogWriter)
-		return
+		return runServer(conf, appRootPath, serverPort, loginOpts, logWriter, consoleLogHub, cliLogWriter)
 	}
 
 	// CLI 模式
-	client, additional, _, db := initializeClients(ctx, conf, appRootPath, loginOpts, bootstrap.dbg)
-	if client == nil || db == nil {
-		log.Fatalln("[startup] Failed to initialize clients or database")
+	client, additional, _, db, err := initializeClients(ctx, conf, appRootPath, loginOpts, bootstrap.dbg)
+	if err != nil {
+		return err
 	}
 	defer db.Close()
 
@@ -197,18 +201,11 @@ func main() {
 		cli.SetClientLogger(c, cliLogWriter)
 	}
 
-	// 信号处理
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, shutdownSignals()...)
-	defer close(sigChan)
-	defer signal.Stop(sigChan)
-	go func() {
-		sig, ok := <-sigChan
-		if ok {
-			log.Warnln("[listener] Caught signal:", sig)
-			cancel()
-		}
-	}()
+	stopSignals := notifyOnShutdownSignal(func(sig os.Signal) {
+		log.Warnf("[listener] Signal caught signal=%s", sig)
+		cancel()
+	})
+	defer stopSignals()
 
 	// 构造依赖
 	deps := &cli.Dependencies{
@@ -223,8 +220,9 @@ func main() {
 
 	// 将 cli 参数传递给 Execute
 	if err := cli.Execute(ctx, bootstrap.cliArgs, deps); err != nil {
-		log.Fatalln("[startup] Execute failed:", err)
+		return fmt.Errorf("[startup] CLI execute failed: %w", err)
 	}
+	return nil
 }
 
 type bootstrapArgs struct {
@@ -306,25 +304,46 @@ func initializeClients(
 	appRootPath string,
 	loginOpts twitter.LoginOptions,
 	enableRequestCounting bool,
-) (*resty.Client, []*resty.Client, *path.StorePath, *sqlx.DB) {
+) (*resty.Client, []*resty.Client, *path.StorePath, *sqlx.DB, error) {
+	pathHelper, err := path.NewStorePath(conf.RootPath)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("[startup] store directory create failed root=%q: %w", logging.Path(conf.RootPath), err)
+	}
+	db, err := database.Connect(pathHelper.DB)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("[db] connect failed path=%q: %w", logging.Path(pathHelper.DB), err)
+	}
+	log.Infof("[db] Connected path=%q", logging.Path(pathHelper.DB))
+	cleanup, cleanupErr := entity.CleanupStagedDirectories(db, pathHelper.Root, pathHelper.Users)
+	if cleanupErr != nil {
+		log.Warnf("[startup] Staged entity directory cleanup incomplete error=%q", cleanupErr.Error())
+	}
+	if cleanup.Restored > 0 || cleanup.Removed > 0 {
+		log.Infof("[startup] Reconciled staged entity directories restored=%d removed=%d", cleanup.Restored, cleanup.Removed)
+	}
+
 	// 登录主账户
 	client, screenName, err := twitter.LoginWithOptions(ctx, conf.Cookie.AuthToken, conf.Cookie.Ct0, loginOpts)
 	if err != nil {
-		log.Fatalln("[startup] Failed to login:", err)
+		startupErr := fmt.Errorf("[startup] login failed: %w", err)
+		if closeErr := db.Close(); closeErr != nil {
+			startupErr = errors.Join(startupErr, fmt.Errorf("[db] close after startup failure: %w", closeErr))
+		}
+		return nil, nil, nil, nil, startupErr
 	}
 	twitter.EnableRateLimit(client)
 	if enableRequestCounting {
 		twitter.EnableRequestCounting(client)
 	}
-	log.Infoln("[startup] Signed in as:", color.FgLightBlue.Render(screenName))
+	log.Infof("[startup] Signed in account=%s", screenName)
 
 	// 加载额外 cookies
 	additionalCookiesPath := filepath.Join(appRootPath, "additional_cookies.yaml")
 	cookies, err := config.ReadAdditionalCookies(additionalCookiesPath)
 	if err != nil {
-		log.Warnln("[startup] Failed to load additional cookies:", err)
+		log.Warnf("[startup] Additional cookies load failed path=%q error=%q", logging.Path(additionalCookiesPath), err.Error())
 	}
-	log.Debugln("[startup] Loaded additional cookies:", len(cookies))
+	log.Debugf("[startup] Additional cookies loaded count=%d", len(cookies))
 
 	twitterCookies := make([]twitter.AccountCookie, len(cookies))
 	for i, c := range cookies {
@@ -334,29 +353,15 @@ func initializeClients(
 	batchOpts := twitter.BatchLoginOptions{Debug: enableRequestCounting}
 	additional := twitter.BatchLogin(ctx, batchOpts, twitterCookies, screenName)
 
-	// 初始化路径和数据库
-	pathHelper, err := path.NewStorePath(conf.RootPath)
-	if err != nil {
-		log.Warnln("[startup] Failed to make store dir:", err)
-		return nil, nil, nil, nil
-	}
-
-	db, err := database.Connect(pathHelper.DB)
-	if err != nil {
-		log.Fatalln("[startup] Failed to connect to database:", err)
-	}
-	log.Infoln("[startup] Database is connected")
-
-	return client, additional, pathHelper, db
+	return client, additional, pathHelper, db, nil
 }
 
-func runServer(conf *config.Config, appRootPath string, port int, loginOpts twitter.LoginOptions, logWriter io.Closer, logHub *consolelog.Hub, cliLogWriter io.Writer) {
+func runServer(conf *config.Config, appRootPath string, port int, loginOpts twitter.LoginOptions, logWriter io.Closer, logHub *consolelog.Hub, cliLogWriter io.Writer) error {
 	ctx := context.Background()
 
-	client, additional, _, db := initializeClients(ctx, conf, appRootPath, loginOpts, false)
-	if client == nil {
-		_, _ = fmt.Fprintln(os.Stderr, "Failed to initialize: unable to create store directory.")
-		return
+	client, additional, _, db, err := initializeClients(ctx, conf, appRootPath, loginOpts, false)
+	if err != nil {
+		return err
 	}
 
 	// 设置客户端日志（lumberjack 自动轮转）
@@ -367,44 +372,48 @@ func runServer(conf *config.Config, appRootPath string, port int, loginOpts twit
 
 	// 创建并启动 API Server
 	// 注意：不再使用 defer db.Close()，因为 GracefulShutdown 会处理所有资源清理
-	server := api.NewServerWithConsoleLogHub(client, additional, db, conf, appRootPath, logWriter, logHub)
-
-	// 信号处理
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, shutdownSignals()...)
-	defer signal.Stop(sigChan)
-	startServerSignalHandler(sigChan, server.GracefulShutdown)
+	server, err := api.NewServerWithConsoleLogHub(client, additional, db, conf, appRootPath, logWriter, logHub)
+	if err != nil {
+		_ = db.Close()
+		return fmt.Errorf("[server] initialize failed: %w", err)
+	}
+	defer server.GracefulShutdown("server-exit")
 
 	// Bot 初始化
 	botConfPath := filepath.Join(appRootPath, "bot_config.yaml")
 	botConf, err := config.LoadBotConfig(botConfPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			if writeErr := writeDefaultBotConfig(botConfPath); writeErr != nil {
-				log.Warnf("[startup] Failed to create default bot config: %v", writeErr)
+			if writeErr := config.WriteDefaultBotConfig(botConfPath); writeErr != nil {
+				log.Warnf("[startup] Default bot config create failed path=%q error=%q", logging.Path(botConfPath), writeErr.Error())
 			}
+		} else if isEmptyBotConfigError(err) {
+			log.Infof("[startup] Bot config skipped reason=empty path=%q", logging.Path(botConfPath))
 		} else {
-			log.Warnf("[startup] Failed to load bot config: %v", err)
+			log.Warnf("[startup] Bot config load failed path=%q error=%q", logging.Path(botConfPath), err.Error())
 		}
 	}
 	server.InitBot(initBot(botConf, server))
+	server.SetBindAddress(conf.BindAddress)
+	stopSignals := notifyOnShutdownSignal(func(sig os.Signal) {
+		log.Warnf("[server] Signal caught signal=%s", sig)
+		server.GracefulShutdown("signal:" + sig.String())
+	})
+	defer stopSignals()
 
 	err = server.Start(port)
 	if err != nil && err != http.ErrServerClosed {
-		log.Fatalln("[startup] Failed to start server:", err)
+		return fmt.Errorf("[server] start failed port=%d: %w", port, err)
 	}
 	if err == http.ErrServerClosed {
+		server.GracefulShutdown("server-closed")
 		server.WaitForShutdown()
 	}
+	return nil
 }
 
-func startServerSignalHandler(sigChan <-chan os.Signal, shutdown func(string)) {
-	go func() {
-		sig := <-sigChan
-		log.Warnln("[server] Caught signal:", sig)
-		// SIGKILL 无法捕获；这里只处理可拦截的退出信号，确保数据库等资源优雅关闭。
-		shutdown("signal:" + sig.String())
-	}()
+func isEmptyBotConfigError(err error) bool {
+	return err == io.EOF
 }
 
 func initBot(botConf *config.BotConfig, server *api.Server) []bot.Bot {
@@ -413,10 +422,10 @@ func initBot(botConf *config.BotConfig, server *api.Server) []bot.Bot {
 	}
 	var bots []bot.Bot
 	if botConf.Telegram != nil && botConf.Telegram.Token != "" {
-		bots = append(bots, telegram.NewBot(botConf.Telegram, server.TaskManager(), server.EventBus(), server.LogHub()))
+		bots = append(bots, telegram.NewBot(botConf.Telegram, server.TaskManager(), server.EventBus(), server.LogHub(), server.EnqueueTask))
 	}
 	if botConf.Discord != nil && botConf.Discord.Token != "" {
-		bots = append(bots, discord.NewBot(botConf.Discord, server.TaskManager(), server.EventBus(), server.LogHub()))
+		bots = append(bots, discord.NewBot(botConf.Discord, server.TaskManager(), server.EventBus(), server.LogHub(), server.EnqueueTask))
 	}
 	if botConf.Gotify != nil && botConf.Gotify.Token != "" && botConf.Gotify.ServerURL != "" {
 		bots = append(bots, gotify.NewBot(botConf.Gotify, server.EventBus(), server.LogHub()))
@@ -425,68 +434,12 @@ func initBot(botConf *config.BotConfig, server *api.Server) []bot.Bot {
 		bots = append(bots, pushover.NewBot(botConf.Pushover, server.EventBus(), server.LogHub()))
 	}
 	if botConf.WeChat != nil && botConf.WeChat.CredentialPath != "" {
-		bots = append(bots, wechat.NewBot(botConf.WeChat, server.TaskManager(), server.EventBus(), server.LogHub()))
+		bots = append(bots, wechat.NewBot(botConf.WeChat, server.TaskManager(), server.EventBus(), server.LogHub(), server.EnqueueTask))
 	}
 	if botConf.Feishu != nil && botConf.Feishu.AppID != "" && botConf.Feishu.AppSecret != "" {
-		feishuBot := feishu.NewBot(botConf.Feishu, server.TaskManager(), server.EventBus(), server.LogHub())
+		feishuBot := feishu.NewBot(botConf.Feishu, server.TaskManager(), server.EventBus(), server.LogHub(), server.EnqueueTask)
 		server.RegisterBotCallback(feishuBot.CallbackPath(), feishuBot.CallbackHandler())
 		bots = append(bots, feishuBot)
 	}
 	return bots
-}
-
-func writeDefaultBotConfig(path string) error {
-	template := `# TMD Bot Configuration
-# Uncomment and configure the platforms you want to use.
-# This file is watched on startup only; changes require a restart.
-
-# --- Telegram ---
-# 1. Create a bot via @BotFather, get the token.
-# 2. Get your user ID by sending a message to the bot, then visit:
-#    https://api.telegram.org/bot<token>/getUpdates → message.from.id
-#telegram:
-#  token: "123456789:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
-#  allowed_users: [123456789]
-
-# --- Discord ---
-# 1. Create app at https://discord.com/developers/applications → Bot → Reset Token
-# 2. Enable Developer Mode in Discord → right-click user → Copy ID
-#discord:
-#  token: "MTE5ODk4MjQ2NzE4NTMyMTI5OQ.GnO2X.xxx"
-#  allowed_users: ["123456789012345678"]
-
-# --- WeChat iLink ---
-# Uses personal WeChat account via iLink protocol. Requires QR code scan on first login.
-# credential_path is relative to the working directory; auto-created after login.
-#wechat:
-#  credential_path: ".weixin-token.json"
-#  allowed_users: ["friend@im.wechat"]
-
-# --- Feishu / Lark ---
-# 1. Create app at https://open.feishu.cn/app → get App ID + App Secret
-# 2. Enable Bot capability, add "Receive message v2.0" event
-# 3. Set callback URL to https://your-domain/api/v1/bot/feishu/callback
-#feishu:
-#  app_id: "cli_xxxxxxxxxxxx"
-#  app_secret: "xxxxxxxxxxxxxxxxxxxxxxxxxx"
-#  verify_token: "xxxxxxxxxxxx"
-#  encrypt_key: ""
-#  allowed_users: ["ou_xxxxxxxxxxxxx"]
-
-# --- Gotify (push only, no commands) ---
-# Self-hosted push notification server. Install from https://github.com/gotify/server
-#gotify:
-#  server_url: "http://gotify.lan:8080"
-#  token: "S3cr3tT0k3n"
-#  priority: 5
-
-# --- Pushover (push only, no commands) ---
-# Register at https://pushover.net → get User Key → create Application/API Token
-#pushover:
-#  user: "uKey123..."
-#  token: "appToken456..."
-#  device: "iphone"
-#  sound: "gamelan"
-`
-	return os.WriteFile(path, []byte(template), 0644)
 }

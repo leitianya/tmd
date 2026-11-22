@@ -15,29 +15,26 @@ func (b *Bot) notifyTaskChanges(data interface{}) {
 		channelID string
 		text      string
 	}
-	b.mu.Lock()
 	var notifications []notification
 	for _, task := range tasks {
-		if task.Status != api.TaskStatusCompleted && task.Status != api.TaskStatusFailed {
+		terminal := task.Status == api.TaskStatusCompleted || task.Status == api.TaskStatusFailed
+		// 取消的任务不发通知，但同样要从追踪表里取出，避免条目永久留在内存里。
+		if !terminal && task.Status != api.TaskStatusCancelled {
 			continue
 		}
-		for channelID, taskIDs := range b.channelTasks {
-			if _, ok := taskIDs[task.ID]; !ok {
-				continue
-			}
-			delete(taskIDs, task.ID)
-			if len(taskIDs) == 0 {
-				delete(b.channelTasks, channelID)
-			}
+		scopes := b.tracker.Drain(task.ID)
+		if !terminal {
+			continue
+		}
+		for _, channelID := range scopes {
 			notifications = append(notifications, notification{channelID: channelID, text: api.FormatTaskResult(task, true)})
 		}
 	}
-	b.mu.Unlock()
 
 	for _, n := range notifications {
 		_, err := b.session.ChannelMessageSend(n.channelID, n.text)
 		if err != nil {
-			log.Warnf("[bot-discord] Failed to send notification: %v", err)
+			log.Warnf("[bot-discord] Send notification failed channel_id=%s error=%q", n.channelID, err.Error())
 		}
 	}
 }
@@ -46,12 +43,12 @@ func (b *Bot) sendLogAlert(line string) {
 	for _, userID := range b.config.AllowedUsers {
 		channel, err := b.session.UserChannelCreate(userID)
 		if err != nil {
-			log.Warnf("[bot-discord] Failed to create DM channel: %v", err)
+			log.Warnf("[bot-discord] Create DM failed user_id=%s error=%q", userID, err.Error())
 			continue
 		}
 		_, err = b.session.ChannelMessageSend(channel.ID, "🔴 `"+escapeDiscord(line)+"`")
 		if err != nil {
-			log.Warnf("[bot-discord] Failed to send log notification: %v", err)
+			log.Warnf("[bot-discord] Send log alert failed channel_id=%s error=%q", channel.ID, err.Error())
 		}
 	}
 }

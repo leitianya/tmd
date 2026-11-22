@@ -1,0 +1,140 @@
+package entity
+
+import (
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestEntityOperationLockSerializesSameKeyAndReleasesEntry(t *testing.T) {
+	parentDir := t.TempDir()
+	key := operationLockKey{kind: "user", ownerID: "1", parentDir: operationParentDirKey(parentDir)}
+	unlockFirst := lockEntityOperation("user", "1", parentDir)
+	attempting := make(chan struct{})
+	acquired := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		close(attempting)
+		unlockSecond := lockEntityOperation("user", "1", filepath.Join(parentDir, "."))
+		close(acquired)
+		unlockSecond()
+		close(done)
+	}()
+	<-attempting
+	require.Eventually(t, func() bool {
+		operationLocks.Lock()
+		defer operationLocks.Unlock()
+		entry := operationLocks.entries[key]
+		return entry != nil && entry.refs == 2
+	}, time.Second, 5*time.Millisecond)
+	select {
+	case <-acquired:
+		t.Fatal("same-key operation acquired before the current holder released it")
+	default:
+	}
+
+	unlockFirst()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("waiting same-key operation did not acquire after release")
+	}
+
+	operationLocks.Lock()
+	_, exists := operationLocks.entries[key]
+	operationLocks.Unlock()
+	assert.False(t, exists, "unused lock entry should be removed")
+}
+
+func TestEntityOperationLockKeepsDifferentKeysIndependent(t *testing.T) {
+	parentDir := t.TempDir()
+	unlockFirst := lockEntityOperation("user", "1", parentDir)
+	defer unlockFirst()
+
+	acquired := make(chan struct{})
+	go func() {
+		unlockSecond := lockEntityOperation("user", "2", parentDir)
+		unlockSecond()
+		close(acquired)
+	}()
+
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("different operation key was unnecessarily blocked")
+	}
+}
+
+func TestEntityStorageParentLockSerializesDifferentOwners(t *testing.T) {
+	parentDir := t.TempDir()
+	parentKey := operationLockKey{kind: "storage-parent", ownerID: "", parentDir: operationParentDirKey(parentDir)}
+	unlockFirstOwner := lockEntityOperation("user", "1", parentDir)
+	defer unlockFirstOwner()
+	unlockParent := lockEntityStorageParent(parentDir)
+
+	attempting := make(chan struct{})
+	acquired := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		unlockSecondOwner := lockEntityOperation("list", "2", parentDir)
+		defer unlockSecondOwner()
+		close(attempting)
+		unlockSecondParent := lockEntityStorageParent(parentDir)
+		close(acquired)
+		unlockSecondParent()
+		close(done)
+	}()
+	<-attempting
+	require.Eventually(t, func() bool {
+		operationLocks.Lock()
+		defer operationLocks.Unlock()
+		entry := operationLocks.entries[parentKey]
+		return entry != nil && entry.refs == 2
+	}, time.Second, 5*time.Millisecond)
+
+	select {
+	case <-acquired:
+		t.Fatal("different owners acquired the same storage parent before release")
+	default:
+	}
+
+	unlockParent()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("different owner did not acquire the storage parent after release")
+	}
+}
+
+func TestEntityOperationLockReleasesAfterRecoveredPanic(t *testing.T) {
+	parentDir := t.TempDir()
+	key := operationLockKey{kind: "list", ownerID: "1", parentDir: operationParentDirKey(parentDir)}
+	func() {
+		defer func() { _ = recover() }()
+		unlock := lockEntityOperation("list", "1", parentDir)
+		defer unlock()
+		panic("test panic")
+	}()
+
+	// panic 后锁引用计数必须归零并删除 entry，否则 map 永久增长。
+	operationLocks.Lock()
+	_, exists := operationLocks.entries[key]
+	operationLocks.Unlock()
+	assert.False(t, exists, "lock entry must be reclaimed after recovered panic")
+
+	unlock := lockEntityOperation("list", "1", parentDir)
+	unlock()
+}
+
+func TestOperationParentDirKeyNormalizesPlatformPath(t *testing.T) {
+	parentDir := t.TempDir()
+	assert.Equal(t, operationParentDirKey(parentDir), operationParentDirKey(filepath.Join(parentDir, ".")))
+	if runtime.GOOS == "windows" {
+		assert.Equal(t, operationParentDirKey(parentDir), operationParentDirKey(strings.ToUpper(parentDir)))
+	}
+}

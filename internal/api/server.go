@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -20,8 +21,13 @@ import (
 	"github.com/unkmonster/tmd/internal/config"
 	"github.com/unkmonster/tmd/internal/consolelog"
 	"github.com/unkmonster/tmd/internal/downloading"
+	"github.com/unkmonster/tmd/internal/logging"
 	"github.com/unkmonster/tmd/internal/scheduler"
 	"github.com/unkmonster/tmd/internal/service"
+)
+
+const (
+	defaultShutdownDrainTimeout = 45 * time.Second
 )
 
 type Server struct {
@@ -36,7 +42,15 @@ type Server struct {
 	downloadQueue     *DownloadQueue
 	logWriter         io.Closer
 	logHub            *consolelog.Hub
+	bindAddress       string
 	httpServer        *http.Server
+	lifecycleMu       sync.Mutex
+	started           bool
+	shuttingDown      bool
+	startupDone       chan struct{}
+	startedBots       []bot.Bot
+	activeMutations   sync.WaitGroup
+	shutdownTimeout   time.Duration
 	shutdownOnce      sync.Once
 	shutdownDone      chan struct{}
 	schedulesMu       sync.Mutex
@@ -44,17 +58,21 @@ type Server struct {
 	scheduler         *scheduler.Scheduler
 	eventBus          *EventBus
 	botCallbacks      map[string]http.HandlerFunc
+	botCallbackPaths  map[string]struct{}
 	bots              []bot.Bot
 	authRateLimit     *authRateLimiter
 }
 
-func NewServer(client *resty.Client, additionalClients []*resty.Client, db *sqlx.DB, config *config.Config, appRootPath string, logWriter io.Closer) *Server {
+func NewServer(client *resty.Client, additionalClients []*resty.Client, db *sqlx.DB, config *config.Config, appRootPath string, logWriter io.Closer) (*Server, error) {
 	return NewServerWithConsoleLogHub(client, additionalClients, db, config, appRootPath, logWriter, consolelog.DefaultHub())
 }
 
-func NewServerWithConsoleLogHub(client *resty.Client, additionalClients []*resty.Client, db *sqlx.DB, config *config.Config, appRootPath string, logWriter io.Closer, logHub *consolelog.Hub) *Server {
+func NewServerWithConsoleLogHub(client *resty.Client, additionalClients []*resty.Client, db *sqlx.DB, config *config.Config, appRootPath string, logWriter io.Closer, logHub *consolelog.Hub) (*Server, error) {
 	if logHub == nil {
 		logHub = consolelog.DefaultHub()
+	}
+	if config == nil {
+		return nil, fmt.Errorf("server config is nil")
 	}
 
 	eventBus := NewEventBus()
@@ -69,15 +87,15 @@ func NewServerWithConsoleLogHub(client *resty.Client, additionalClients []*resty
 		logHub:            logHub,
 		taskManager:       NewTaskManager(eventBus),
 		shutdownDone:      make(chan struct{}),
-		botCallbacks:     make(map[string]http.HandlerFunc),
+		botCallbacks:      make(map[string]http.HandlerFunc),
+		botCallbackPaths:  make(map[string]struct{}),
 		eventBus:          eventBus,
 		authRateLimit: &authRateLimiter{
 			attempts: make(map[string]*rateLimitEntry),
 			stopCh:   make(chan struct{}),
 		},
+		shutdownTimeout: defaultShutdownDrainTimeout,
 	}
-
-	s.authRateLimit.startCleanupLoop()
 
 	// 配置副本：使 service.Dependencies 持有独立的 Config 副本，
 	// 避免与 Server.config 共享同一指针。这样 handleUpdateConfigRaw
@@ -89,26 +107,28 @@ func NewServerWithConsoleLogHub(client *resty.Client, additionalClients []*resty
 		AdditionalClients: additionalClients,
 		DB:                db,
 		Config:            &configCopy,
-		AppRootPath:      appRootPath,
+		AppRootPath:       appRootPath,
 		ListSyncManager:   downloading.NewListSyncManager(db),
 	})
 	if err != nil {
-		log.Fatalf("[server] Failed to create download service: %v", err)
+		s.taskManager.Close()
+		eventBus.Close()
+		return nil, fmt.Errorf("download service create failed: %w", err)
 	}
 	s.downloadService = downloadService
 	s.downloadQueue = NewDownloadQueue(s)
-
+	s.authRateLimit.startCleanupLoop()
 
 	schedulesPath := filepath.Join(appRootPath, "schedules.yaml")
 	sched, err := scheduler.New(schedulesPath, s.scheduledDownload)
 	if err != nil {
-		log.Warnf("[scheduler] Failed to initialize scheduler: %v", err)
+		log.Warnf("[scheduler] Initialize failed path=%q error=%q", logging.Path(schedulesPath), err.Error())
 	} else {
 		sched.OnStatusChange = s.handleScheduleStatusChange
 		s.scheduler = sched
 	}
 
-	return s
+	return s, nil
 }
 
 func (s *Server) getScheduler() *scheduler.Scheduler {
@@ -123,8 +143,59 @@ func (s *Server) InitBot(bots []bot.Bot) {
 }
 
 // RegisterBotCallback 注册 bot 平台的 HTTP 回调路由。在 Start() 之前调用。
+// 同步登记公开路径：第三方平台回调（如 Feishu）不带 TMD Bearer，自身用
+// verify_token/encrypt_key 校验事件；启用 API Key 后这些精确路径必须免
+// TMD 认证。只放行实际注册的回调路径，不放行宽泛 /api/v1/bot/ 前缀。
 func (s *Server) RegisterBotCallback(pattern string, handler http.HandlerFunc) {
+	if s.botCallbacks == nil {
+		s.botCallbacks = make(map[string]http.HandlerFunc)
+	}
 	s.botCallbacks[pattern] = handler
+	// 回调注册先于 Start()（main.go InitBot → Start 顺序），此后只读，
+	// 无需加锁。authMiddleware 按精确路径放行已注册回调。
+	if s.botCallbackPaths == nil {
+		s.botCallbackPaths = make(map[string]struct{})
+	}
+	s.botCallbackPaths[pattern] = struct{}{}
+}
+
+// SetBindAddress 设置 Server 监听地址（Start 前调用）。空值表示监听所有
+// 网卡（保持 start-server.bat / Docker 兼容）；显式设置 loopback 可收紧默认
+// 安全边界。
+func (s *Server) SetBindAddress(addr string) {
+	s.bindAddress = addr
+}
+
+// serverListenAddr 构造 http.Server 的监听地址。
+func serverListenAddr(bindAddress string, port int) string {
+	if bindAddress == "" {
+		return fmt.Sprintf(":%d", port)
+	}
+	return net.JoinHostPort(bindAddress, strconv.Itoa(port))
+}
+
+// currentAPIKey 读取当前配置中的 API Key（空串表示未启用认证）。
+func (s *Server) currentAPIKey() string {
+	if s == nil || s.config == nil {
+		return ""
+	}
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	return s.config.APIKey
+}
+
+// shouldWarnUnsafeBind 判断是否需要提示不安全的绑定组合：监听非 loopback
+// 且未配置 API Key 时，任意同网段客户端可无认证访问删除/关停接口。
+func shouldWarnUnsafeBind(bindAddress, apiKey string) bool {
+	if apiKey != "" {
+		return false
+	}
+	switch bindAddress {
+	case "127.0.0.1", "::1", "localhost":
+		return false
+	default:
+		return true
+	}
 }
 
 // TaskManager 返回任务管理器（用于 bot 集成）
@@ -165,6 +236,11 @@ func (s *Server) buildHandler() http.Handler {
 	mux.HandleFunc("POST /api/v1/tasks/cancel-queued", s.handleCancelQueuedTasks)
 	mux.HandleFunc("POST /api/v1/tasks/{task_id}/retry", s.handleRetryTask)
 	mux.HandleFunc("DELETE /api/v1/tasks/{task_id}", s.handleDeleteTask)
+	mux.HandleFunc("GET /api/v1/tasks/query", s.handleTasksQuery)
+	mux.HandleFunc("POST /api/v1/tasks/batch/cancel", s.handleBatchTask)
+	mux.HandleFunc("POST /api/v1/tasks/batch/delete", s.handleBatchTask)
+	mux.HandleFunc("POST /api/v1/tasks/batch/retry", s.handleBatchTask)
+	mux.HandleFunc("GET /api/v1/download/context", s.handleDownloadContext)
 	mux.HandleFunc("GET /api/v1/errors", s.handleErrors)
 	mux.HandleFunc("POST /api/v1/errors/retry", s.handleRetryAllFailed)
 	mux.HandleFunc("DELETE /api/v1/errors", s.handleClearErrors)
@@ -249,14 +325,14 @@ func (s *Server) buildHandler() http.Handler {
 		mux.HandleFunc(pattern, cb)
 	}
 
-
 	var handler http.Handler = mux
-
 	// authMiddleware 在 CORS 内层：OPTIONS 预检请求由 CORS 直接处理，不经过 auth。
 	// 当 api_key 为空时 authMiddleware 直接放行，不改变现有行为。
 	handler = s.authMiddleware(handler)
+	// 关停闸门在认证外层，使所有新写请求在关停期间一致获得 503。
+	handler = s.shutdownMutationMiddleware(handler)
 
-	// 注意中间件的包裹顺序：最外层是 Logging，里面一层是 CORS，最里面是 Mux + Auth。
+	// 注意中间件的包裹顺序：最外层是 Logging，里面一层是 CORS，再往内是关停闸门 + Auth + Mux。
 	// 这样 Logging 就能记录到所有请求，包括那些被 CORS 拦截的 OPTIONS 预检请求。
 	handler = cors.New(cors.Options{
 		AllowedOrigins: []string{"*"},
@@ -276,6 +352,23 @@ func (s *Server) buildHandler() http.Handler {
 	return handler
 }
 
+func (s *Server) shutdownMutationMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+			s.lifecycleMu.Lock()
+			if s.shuttingDown {
+				s.lifecycleMu.Unlock()
+				s.writeError(w, http.StatusServiceUnavailable, "Server is shutting down")
+				return
+			}
+			s.activeMutations.Add(1)
+			s.lifecycleMu.Unlock()
+			defer s.activeMutations.Done()
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
 // getPrimaryIP 通过 UDP 连接获取主网卡 IP（不发送数据包、无网络开销）
 // OS 路由表自动选择默认网关路由的网卡，过滤掉所有虚拟网卡
@@ -290,75 +383,113 @@ func getPrimaryIP() string {
 func (s *Server) Start(port int) error {
 	handler := s.buildHandler()
 
-	addr := fmt.Sprintf(":%d", port)
-	log.Infof("[server] API server starting on %s", addr)
-	blue := color.FgLightBlue.Render
-	log.Infof("[server] Visit %s to get started", blue("http://localhost"+addr+"/"))
-	if lanIP := getPrimaryIP(); lanIP != "" {
-		log.Infof("[server] Visit %s to get started", blue("http://"+lanIP+addr+"/"))
-	}
-
-	s.httpServer = &http.Server{
+	addr := serverListenAddr(s.bindAddress, port)
+	httpServer := &http.Server{
 		Addr:        addr,
 		Handler:     handler,
 		ReadTimeout: 30 * time.Second,
 		IdleTimeout: 60 * time.Second,
 	}
 
+	s.lifecycleMu.Lock()
+	if s.shuttingDown {
+		s.lifecycleMu.Unlock()
+		return http.ErrServerClosed
+	}
+	if s.started {
+		s.lifecycleMu.Unlock()
+		return fmt.Errorf("server already started")
+	}
+	s.started = true
+	s.httpServer = httpServer
+	startupDone := make(chan struct{})
+	s.startupDone = startupDone
+	s.startedBots = nil
+	s.lifecycleMu.Unlock()
+
+	log.Infof("[server] API server starting addr=%s", addr)
+	if shouldWarnUnsafeBind(s.bindAddress, s.currentAPIKey()) {
+		log.Warnf("[server] Listening on a non-loopback address without an API key — any host on the local network can reach delete/shutdown endpoints. Set api_key or bind to 127.0.0.1.")
+	}
+	blue := color.FgLightBlue.Render
+	log.Infof("[server] Web UI at %s", blue("http://localhost"+addr+"/"))
+	if lanIP := getPrimaryIP(); lanIP != "" {
+		log.Infof("[server] Web UI at %s", blue("http://"+lanIP+addr+"/"))
+	}
+
 	if sched := s.getScheduler(); sched != nil {
-		sched.Start()
-	}
-
-	for _, b := range s.bots {
-		if err := b.Start(); err != nil {
-			log.Errorf("[bot] Failed to start %s: %v", b.Name(), err)
-			continue
+		if s.isShuttingDown() {
+			// startBots 尚未启动，其 defer close(startupDone) 不会执行；
+			// 关闭通道避免关停的 bot 阶段在 <-startupDone 上空等满截止时间。
+			close(startupDone)
+			return http.ErrServerClosed
 		}
-		log.Infof("[bot] %s started", b.Name())
+		sched.Start()
+		if s.isShuttingDown() {
+			close(startupDone)
+			return http.ErrServerClosed
+		}
 	}
 
-	return s.httpServer.ListenAndServe()
+	// Bot providers are optional adapters. Start them concurrently in the
+	// background so a slow external service cannot delay the core HTTP API.
+	go s.startBots(startupDone)
+	return httpServer.ListenAndServe()
 }
 
-func (s *Server) handleGetTheme(w http.ResponseWriter, r *http.Request) {
-	s.writeJSON(w, http.StatusOK, NewSuccessResponse(map[string]string{
-		"theme": getFrontendTheme(),
-	}))
+func (s *Server) startBots(done chan<- struct{}) {
+	defer close(done)
+
+	var starts sync.WaitGroup
+	for _, b := range s.bots {
+		if !s.beginBotStart(b) {
+			break
+		}
+		starts.Add(1)
+		go func(b bot.Bot) {
+			defer starts.Done()
+			if err := b.Start(); err != nil {
+				log.Errorf("[bot] Start failed provider=%s error=%q", b.Name(), err.Error())
+				return
+			}
+			log.Infof("[bot] Started provider=%s", b.Name())
+		}(b)
+	}
+
+	// 等待所有 bot 启动，但受关停截止约束：某 provider 的 Start 挂死时
+	// （例如 discord 网关握手后黑洞，Hello/READY 无界读），startupDone
+	// 必须在截止时间内关闭，否则关停的 bot 阶段空等满预算且已启动的
+	// bot 收不到 Stop。挂死的 goroutine 由进程退出兜底。
+	waitCh := make(chan struct{})
+	go func() {
+		starts.Wait()
+		close(waitCh)
+	}()
+	timeout := s.shutdownTimeout
+	if timeout <= 0 {
+		timeout = defaultShutdownDrainTimeout
+	}
+	select {
+	case <-waitCh:
+	case <-time.After(timeout):
+		log.Warnf("[server] Bot startup drain timed out timeout=%s", timeout)
+	}
 }
 
-func (s *Server) handleSetTheme(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Theme string `json:"theme"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Debugf("[theme] Invalid request body: %v", err)
-		s.writeError(w, http.StatusBadRequest, "Invalid JSON body")
-		return
-	}
-
-	if !setFrontendTheme(req.Theme) {
-		log.Warnf("[theme] Invalid theme directory: %q", req.Theme)
-		s.writeError(w, http.StatusBadRequest, "Invalid theme: directory not found or missing index.html")
-		return
-	}
-
-	log.Infof("[theme] Switched to %s", req.Theme)
-	s.writeJSON(w, http.StatusOK, NewSuccessResponse(map[string]string{
-		"theme": getFrontendTheme(),
-	}))
+func (s *Server) isShuttingDown() bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	return s.shuttingDown
 }
 
-func (s *Server) handleGetThemes(w http.ResponseWriter, r *http.Request) {
-	themes := listThemes()
-	if themes == nil {
-		log.Errorf("[theme] Failed to list themes")
-		s.writeError(w, http.StatusInternalServerError, "Failed to list themes")
-		return
+func (s *Server) beginBotStart(b bot.Bot) bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.shuttingDown {
+		return false
 	}
-	s.writeJSON(w, http.StatusOK, NewSuccessResponse(map[string]interface{}{
-		"themes":  themes,
-		"current": getFrontendTheme(),
-	}))
+	s.startedBots = append(s.startedBots, b)
+	return true
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -377,15 +508,21 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleFavicon(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "image/svg+xml")
-	w.Write([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#2563eb"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>`))
+	w.Write([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" style="color:#2563eb"><path fill="currentColor" d="M582 88c16 0 28 12 28 28v178h192c23 0 34 28 17 45l-76 76c-5 5-12 8-20 8H610v248c0 80 43 129 130 145 25 5 35 35 19 54l-70 82c-8 9-20 14-32 11-122-27-205-122-205-267V423H274c-24 0-35-29-17-46l77-75c5-5 12-8 19-8h99V116c0-16 12-28 28-28h102Zm-74 335v290c0 102 59 177 153 209l42-49c-99-31-149-101-149-202V423h-46Z"/></svg>`))
 }
 
-func (s *Server) writeJSON(w http.ResponseWriter, status int, data interface{}) {
+// writeJSONResponse 将 data 以 JSON 形式写入响应（Content-Type: application/json）。
+// writeJSON 方法与 writeAuth401 共用此包级函数；writeAuth401 的额外响应头由调用方先设置。
+func writeJSONResponse(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(data); err != nil {
-		log.Warnf("[api] Failed to write response: %v", err)
+		log.Warnf("[api] Response write failed error=%q", err.Error())
 	}
+}
+
+func (s *Server) writeJSON(w http.ResponseWriter, status int, data interface{}) {
+	writeJSONResponse(w, status, data)
 }
 
 func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
@@ -401,12 +538,8 @@ func (s *Server) handleServerShutdown(w http.ResponseWriter, _ *http.Request) {
 		"action":  "shutdown",
 	}))
 
-	log.Infoln("[server] Received shutdown request, performing graceful shutdown...")
-
-	go func() {
-		time.Sleep(500 * time.Millisecond)
-		s.GracefulShutdown("shutdown")
-	}()
+	log.Info("[server] Shutdown requested source=api")
+	go s.GracefulShutdown("shutdown")
 }
 
 func (s *Server) WaitForShutdown() {
@@ -415,75 +548,180 @@ func (s *Server) WaitForShutdown() {
 
 func (s *Server) GracefulShutdown(reason string) {
 	s.shutdownOnce.Do(func() {
+		shutdownTimeout := durationOrDefault(s.shutdownTimeout, defaultShutdownDrainTimeout)
+		deadline := time.Now().Add(shutdownTimeout)
+
+		s.lifecycleMu.Lock()
+		s.shuttingDown = true
+		httpServer := s.httpServer
+		startupDone := s.startupDone
+		s.lifecycleMu.Unlock()
+
 		if s.eventBus != nil {
 			s.eventBus.PublishServerShutdown("服务器正在关闭: " + reason)
-			time.Sleep(100 * time.Millisecond)
 		}
 
-		log.Infof("[server] Graceful shutdown started (reason: %s)", reason)
+		log.Infof("[server] Graceful shutdown started reason=%q timeout=%s", reason, shutdownTimeout)
 
 		if s.taskManager != nil {
 			s.taskManager.CancelAllTasks()
 			s.taskManager.Close()
-			log.Infoln("[server] All running tasks cancelled")
-			time.Sleep(1 * time.Second)
+			log.Info("[server] Running tasks cancelled")
 		}
+
+		mutationDone := waitGroupDone(&s.activeMutations)
+		queueDone := completedSignal()
 		if s.downloadQueue != nil {
-			s.downloadQueue.CloseAndWait(15 * time.Second)
+			queueDone = runShutdownPhase(func() {
+				s.downloadQueue.CloseAndWait(boundedRemaining(deadline))
+			})
 		}
 
+		schedulerDone := completedSignal()
 		if sched := s.getScheduler(); sched != nil {
-			sched.Stop()
+			schedulerDone = runShutdownPhase(sched.Stop)
 		}
 
-		for _, b := range s.bots {
-			b.Stop()
-			log.Infof("[bot] %s stopped", b.Name())
+		botDone := runShutdownPhase(func() {
+			if startupDone != nil {
+				<-startupDone
+			}
+			s.stopStartedBots()
+		})
+
+		httpDone := completedSignal()
+		if httpServer != nil {
+			httpDone = runShutdownPhase(func() {
+				shutdownCtx, shutdownCancel := context.WithDeadline(context.Background(), deadline)
+				defer shutdownCancel()
+
+				if err := httpServer.Shutdown(shutdownCtx); err != nil {
+					log.Warnf("[server] HTTP shutdown failed error=%q", err.Error())
+					if closeErr := httpServer.Close(); closeErr != nil && closeErr != http.ErrServerClosed {
+						log.Warnf("[server] HTTP force close failed error=%q", closeErr.Error())
+					}
+					return
+				}
+				log.Info("[server] HTTP server stopped")
+			})
 		}
 
-		// Close SSE connections so httpServer.Shutdown() doesn't wait 30s for them.
-		if s.eventBus != nil {
-			s.eventBus.Close()
-		}
+		// Log streams have no shutdown event, so close them immediately. Task SSE
+		// streams exit themselves after flushing the server_shutdown event.
 		if s.logHub != nil {
 			s.logHub.Close()
 		}
-
 		if s.authRateLimit != nil {
 			s.authRateLimit.Stop()
 		}
 
-		if s.httpServer != nil {
-			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer shutdownCancel()
-
-			if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
-				log.Warnf("[server] HTTP server shutdown error: %v", err)
-			} else {
-				log.Infoln("[server] HTTP server stopped gracefully")
+		phases := []struct {
+			name string
+			done <-chan struct{}
+		}{
+			{name: "active mutations", done: mutationDone},
+			{name: "download queue", done: queueDone},
+			{name: "scheduler", done: schedulerDone},
+			{name: "bot startup and stop", done: botDone},
+			{name: "HTTP server", done: httpDone},
+		}
+		for _, phase := range phases {
+			if !waitChannelUntil(phase.done, deadline) {
+				log.Warnf("[server] Shutdown phase timed out phase=%q timeout=%s", phase.name, shutdownTimeout)
 			}
 		}
 
-		if s.logWriter != nil {
-			if err := s.logWriter.Close(); err != nil {
-				log.Warnf("[server] Failed to close log writer: %v", err)
-			} else {
-				log.Infoln("[server] Log writer closed")
-			}
+		if s.eventBus != nil {
+			s.eventBus.Close()
 		}
 
 		if s.db != nil {
 			if err := s.db.Close(); err != nil {
-				log.Warnf("[server] Failed to close database: %v", err)
+				log.Warnf("[server] Database close failed error=%q", err.Error())
 			} else {
-				log.Infoln("[server] Database connection closed")
+				log.Info("[server] Database connection closed")
 			}
 		}
 
-		time.Sleep(100 * time.Millisecond)
-		log.Infoln("[server] Shutdown complete")
+		log.Info("[server] Shutdown complete")
 		close(s.shutdownDone)
 	})
+}
+
+func (s *Server) stopStartedBots() {
+	s.lifecycleMu.Lock()
+	startedBots := append([]bot.Bot(nil), s.startedBots...)
+	s.lifecycleMu.Unlock()
+
+	var stops sync.WaitGroup
+	for _, b := range startedBots {
+		stops.Add(1)
+		go func(b bot.Bot) {
+			defer stops.Done()
+			b.Stop()
+			log.Infof("[bot] Stopped provider=%s", b.Name())
+		}(b)
+	}
+	stops.Wait()
+}
+
+func durationOrDefault(value, fallback time.Duration) time.Duration {
+	if value > 0 {
+		return value
+	}
+	return fallback
+}
+
+func waitGroupDone(group *sync.WaitGroup) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		group.Wait()
+		close(done)
+	}()
+	return done
+}
+
+func completedSignal() <-chan struct{} {
+	done := make(chan struct{})
+	close(done)
+	return done
+}
+
+func runShutdownPhase(fn func()) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	return done
+}
+
+func boundedRemaining(deadline time.Time) time.Duration {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return time.Nanosecond
+	}
+	return remaining
+}
+
+func waitChannelUntil(done <-chan struct{}, deadline time.Time) bool {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 func (s *Server) handleScheduleStatusChange(running bool, statuses []scheduler.ScheduleStatus) {

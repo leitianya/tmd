@@ -2,6 +2,8 @@ package twitter
 
 import (
 	"testing"
+
+	"github.com/tidwall/gjson"
 )
 
 // ==================== CheckApiResp 测试 ====================
@@ -52,15 +54,6 @@ func TestCheckApiResp_ErrorCode214NoData(t *testing.T) {
 		t.Fatal("expected error for code 214 without data, got nil")
 	}
 }
-
-func TestCheckApiResp_InvalidJSON(t *testing.T) {
-	body := []byte(`not json`)
-	err := CheckApiResp(body)
-	if err != nil {
-		t.Logf("got expected error for invalid JSON: %v", err)
-	}
-}
-
 func TestCheckApiResp_NoCodeInExtensions(t *testing.T) {
 	// errors array exists but no extensions.code field
 	body := []byte(`{"errors": [{"message": "some error"}]}`)
@@ -168,27 +161,6 @@ func TestUser_IsVisiable_ProtectedUnfollowed(t *testing.T) {
 	}
 }
 
-func TestUser_IsVisiable_ProtectedRequested(t *testing.T) {
-	u := User{
-		IsProtected: true,
-		Followstate: FS_REQUESTED,
-	}
-	// IsVisiable returns Followstate == FS_FOLLOWING || !IsProtected
-	// FS_REQUESTED is NOT FS_FOLLOWING, and IsProtected=true
-	if u.IsVisiable() {
-		t.Log("IsVisiable=true for FS_REQUESTED (as expected)")
-	} else {
-		t.Log("IsVisiable=false for FS_REQUESTED (also valid — only FS_FOLLOWING counts)")
-	}
-}
-
-func TestUser_Following(t *testing.T) {
-	u := User{
-		ScreenName: "testuser",
-	}
-	_ = u.Following()
-}
-
 // ==================== FollowState 常量测试 ====================
 
 func TestFollowState_Constants(t *testing.T) {
@@ -238,5 +210,86 @@ func TestUserFollowing_Title_EmptyScreenName(t *testing.T) {
 	title := uf.Title()
 	if title == "" {
 		t.Error("Title() should not be empty even with empty ScreenName")
+	}
+}
+
+// ==================== bestVideoVariantURL 测试 ====================
+
+func TestBestVideoVariantURL_PicksMaxBitrate(t *testing.T) {
+	// 变体未按码率排序时，显式选择最高码率（旧 @reverse.0 会误选最后一项）。
+	variants := gjson.Parse(`[
+		{"bitrate": 832000, "content_type": "video/mp4", "url": "https://x.com/v/832k.mp4"},
+		{"bitrate": 256000, "content_type": "video/mp4", "url": "https://x.com/v/256k.mp4"},
+		{"content_type": "application/x-mpegURL", "url": "https://x.com/v/playlist.m3u8"}
+	]`)
+	got := bestVideoVariantURL(variants)
+	if got != "https://x.com/v/832k.mp4" {
+		t.Errorf("bestVideoVariantURL() = %q, want max-bitrate mp4", got)
+	}
+}
+
+func TestBestVideoVariantURL_SkipsPlaylistWhenBitratesExist(t *testing.T) {
+	// m3u8 播放列表（无 bitrate）在末尾且最大码率不在末位：旧 @reverse.0
+	// 会选中末尾的 m3u8；新逻辑必须跳过播放列表取最高码率 mp4。
+	variants := gjson.Parse(`[
+		{"bitrate": 1280000, "content_type": "video/mp4", "url": "https://x.com/v/1280k.mp4"},
+		{"bitrate": 832000, "content_type": "video/mp4", "url": "https://x.com/v/832k.mp4"},
+		{"content_type": "application/x-mpegURL", "url": "https://x.com/v/playlist.m3u8"}
+	]`)
+	got := bestVideoVariantURL(variants)
+	if got != "https://x.com/v/1280k.mp4" {
+		t.Errorf("bestVideoVariantURL() = %q, want highest-bitrate mp4 (not the trailing playlist)", got)
+	}
+}
+
+func TestBestVideoVariantURL_FallsBackToLastWithoutBitrate(t *testing.T) {
+	// 全无 bitrate（如仅播放列表）时兜底取最后一个 URL，复现旧 @reverse.0 行为。
+	variants := gjson.Parse(`[
+		{"content_type": "application/x-mpegURL", "url": "https://x.com/v/a.m3u8"},
+		{"content_type": "application/x-mpegURL", "url": "https://x.com/v/b.m3u8"}
+	]`)
+	got := bestVideoVariantURL(variants)
+	if got != "https://x.com/v/b.m3u8" {
+		t.Errorf("bestVideoVariantURL() = %q, want last variant URL", got)
+	}
+}
+
+func TestBestVideoVariantURL_Empty(t *testing.T) {
+	if got := bestVideoVariantURL(gjson.Parse(`[]`)); got != "" {
+		t.Errorf("bestVideoVariantURL(empty) = %q, want empty", got)
+	}
+	if got := bestVideoVariantURL(gjson.Parse(`[{"content_type": "video/mp4"}]`)); got != "" {
+		t.Errorf("bestVideoVariantURL(no urls) = %q, want empty", got)
+	}
+}
+
+func TestGetUrlsFromMediaKeepsLegacyVideoVariantForCompatibility(t *testing.T) {
+	media := gjson.Parse(`[
+		{
+			"type": "video",
+			"video_info": {"variants": [
+				{"bitrate": 1280000, "url": "https://example.invalid/video.mp4"},
+				{"url": "https://example.invalid/playlist.m3u8"}
+			]}
+		},
+		{"type": "photo", "media_url_https": "https://example.invalid/photo.jpg"}
+	]`)
+
+	urls, legacyURLs := getUrlsFromMedia(&media)
+
+	if got, want := len(urls), 2; got != want {
+		t.Fatalf("URLs length = %d, want %d", got, want)
+	}
+	if got, want := len(legacyURLs), len(urls); got != want {
+		t.Fatalf("legacy URLs length = %d, want %d", got, want)
+	}
+	if urls[0] != "https://example.invalid/video.mp4" {
+		t.Fatalf("preferred video URL = %q", urls[0])
+	}
+	if legacyURLs[0] != "https://example.invalid/playlist.m3u8" {
+		t.Fatalf("legacy video URL = %q", legacyURLs[0])
+	}
+	if legacyURLs[1] != urls[1] {
+		t.Fatalf("photo legacy URL = %q, want %q", legacyURLs[1], urls[1])
 	}
 }

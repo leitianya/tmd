@@ -7,6 +7,7 @@ import (
 
 	"github.com/unkmonster/tmd/internal/api"
 )
+
 func (b *Bot) notifyTaskChanges(data interface{}) {
 	tasks, ok := data.([]*api.Task)
 	if !ok {
@@ -16,27 +17,28 @@ func (b *Bot) notifyTaskChanges(data interface{}) {
 		chatID string
 		text   string
 	}
-	b.mu.Lock()
 	var notifications []notification
 	for _, task := range tasks {
-		if task.Status != api.TaskStatusCompleted && task.Status != api.TaskStatusFailed {
+		terminal := task.Status == api.TaskStatusCompleted || task.Status == api.TaskStatusFailed
+		// 取消的任务不发通知，但同样要从追踪表里取出，避免条目永久留在内存里。
+		if !terminal && task.Status != api.TaskStatusCancelled {
+			continue
+		}
+		scopes := b.tracker.Drain(task.ID)
+		if !terminal {
 			continue
 		}
 		text := api.FormatTaskResult(task, false)
-		for openID, taskIDs := range b.userTasks {
-			if _, ok := taskIDs[task.ID]; !ok {
+		for _, openID := range scopes {
+			b.mu.Lock()
+			chatID, ok := b.userChats[openID]
+			b.mu.Unlock()
+			if !ok {
 				continue
 			}
-			delete(taskIDs, task.ID)
-			if len(taskIDs) == 0 {
-				delete(b.userTasks, openID)
-			}
-			if chatID, ok := b.userChats[openID]; ok {
-				notifications = append(notifications, notification{chatID: chatID, text: text})
-			}
+			notifications = append(notifications, notification{chatID: chatID, text: text})
 		}
 	}
-	b.mu.Unlock()
 
 	for _, n := range notifications {
 		b.sendText(n.chatID, n.text)
@@ -55,7 +57,7 @@ func (b *Bot) sendLogAlert(line string) {
 		ctx := context.Background()
 		_, _, err := b.cli.Message.Send().ToChatID(chatID).SendText(ctx, "🔴 "+line)
 		if err != nil {
-			log.Warnf("[bot-feishu] Failed to send log notification: %v", err)
+			log.Warnf("[bot-feishu] Send log alert failed chat_id=%s error=%q", chatID, err.Error())
 		}
 	}
 }

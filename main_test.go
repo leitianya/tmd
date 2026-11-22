@@ -1,13 +1,43 @@
 package main
 
 import (
+	"errors"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/unkmonster/tmd/internal/config"
 )
+
+func TestConfigureTerminalColorsRespectsNoColor(t *testing.T) {
+	tests := []struct {
+		name          string
+		noColor       string
+		forceColors   bool
+		disableColors bool
+	}{
+		{name: "enabled by default", forceColors: true},
+		{name: "disabled by convention", noColor: "1", disableColors: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("NO_COLOR", tt.noColor)
+			formatter := &log.TextFormatter{}
+
+			configureTerminalColors(formatter)
+
+			assert.Equal(t, tt.forceColors, formatter.ForceColors)
+			assert.Equal(t, tt.disableColors, formatter.DisableColors)
+		})
+	}
+}
 
 func TestParseBootstrapArgs(t *testing.T) {
 	parsed, err := parseBootstrapArgs([]string{
@@ -65,6 +95,39 @@ func TestParseBootstrapArgsPassesUnknownFlagsToCLI(t *testing.T) {
 	assert.Equal(t, []string{"-unknown", "value", "-user", "alice"}, parsed.cliArgs)
 }
 
+func TestRunReturnsBootstrapErrors(t *testing.T) {
+	err := run([]string{"-port", "invalid"})
+
+	assert.EqualError(t, err, `invalid -port "invalid": must be an integer from 1 to 65535`)
+}
+
+func TestRunLogsFinalStartupError(t *testing.T) {
+	const helperEnv = "TMD_TEST_RUN_STARTUP_ERROR"
+	if os.Getenv(helperEnv) == "1" {
+		err := run(nil)
+		var logged *loggedError
+		if err == nil || !errors.As(err, &logged) {
+			os.Exit(2)
+		}
+		os.Exit(0)
+	}
+
+	appRoot := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(appRoot, "conf.yaml"), []byte("root_path: ["), 0600))
+	t.Setenv(helperEnv, "1")
+	t.Setenv("TMD_HOME", appRoot)
+	t.Setenv("TMD_PORT", "")
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRunLogsFinalStartupError$")
+	output, err := cmd.CombinedOutput()
+	require.NoErrorf(t, err, "helper process failed: %s", output)
+
+	logData, err := os.ReadFile(filepath.Join(appRoot, "tmd2.log"))
+	require.NoError(t, err)
+	assert.Contains(t, string(logData), "[startup] Process failed")
+	assert.Contains(t, string(logData), "config load failed")
+}
+
 func TestValidateConfigRequiresRootPath(t *testing.T) {
 	err := config.Validate(nil)
 	assert.EqualError(t, err, "config is nil")
@@ -73,4 +136,10 @@ func TestValidateConfigRequiresRootPath(t *testing.T) {
 	assert.EqualError(t, err, "root_path is required; set it in conf.yaml or TMD_ROOT_PATH")
 
 	assert.NoError(t, config.Validate(&config.Config{RootPath: t.TempDir()}))
+}
+
+func TestIsEmptyBotConfigError(t *testing.T) {
+	assert.True(t, isEmptyBotConfigError(io.EOF))
+	assert.False(t, isEmptyBotConfigError(assert.AnError))
+	assert.False(t, isEmptyBotConfigError(nil))
 }

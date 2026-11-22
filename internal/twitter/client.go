@@ -14,6 +14,7 @@ import (
 
 	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"
+	"github.com/unkmonster/tmd/internal/logging"
 	"github.com/unkmonster/tmd/internal/utils"
 )
 
@@ -22,7 +23,14 @@ const bearer = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Z
 var clientScreenNames sync.Map
 var clientErrors sync.Map
 var clientRateLimiters sync.Map
+var clientCooldowns sync.Map
 var apiCounts sync.Map
+
+var globalCooldownMu sync.Mutex
+var globalCooldownUntil time.Time
+var additionalClientCursor atomic.Uint64
+
+const defaultClientCooldown = 60 * time.Second
 
 func SetClientAuth(client *resty.Client, authToken string, ct0 string) {
 	client.SetAuthToken(bearer)
@@ -45,11 +53,6 @@ func SetClientAuth(client *resty.Client, authToken string, ct0 string) {
 type LoginOptions struct {
 }
 
-// Login 登录Twitter
-func Login(ctx context.Context, authToken string, ct0 string) (*resty.Client, string, error) {
-	return LoginWithOptions(ctx, authToken, ct0, LoginOptions{})
-}
-
 // LoginWithOptions 使用选项登录Twitter
 func LoginWithOptions(ctx context.Context, authToken string, ct0 string, opts LoginOptions) (*resty.Client, string, error) {
 	client := resty.New()
@@ -59,6 +62,17 @@ func LoginWithOptions(ctx context.Context, authToken string, ct0 string, opts Lo
 
 	// 错误检查
 	client.OnAfterResponse(func(c *resty.Client, r *resty.Response) error {
+		if r.StatusCode() >= 400 {
+			body := string(r.Body())
+			if len(body) > 200 {
+				body = body[:200] + "...(truncated)"
+			}
+			log.Debugf("[twitter] Response error endpoint=%s account=%s status=%d retry_after=%s body=%q",
+				endpointForLog(r.Request.URL), clientNameForLog(c), r.StatusCode(), r.Header().Get("Retry-After"), logging.RedactSensitiveText(body))
+		}
+		if r.StatusCode() == http.StatusTooManyRequests {
+			setClientCooldown(c, parseRetryAfter(r.Header().Get("Retry-After")))
+		}
 		if err := CheckApiResp(r.Body()); err != nil {
 			return err
 		}
@@ -120,7 +134,17 @@ func LoginWithOptions(ctx context.Context, authToken string, ct0 string, opts Lo
 		}
 		// HTTP 429 速率限制
 		v, ok := err.(*utils.HttpStatusError)
-		return ok && r.Request != nil && r.Request.RawRequest != nil && r.Request.RawRequest.Host == "x.com" && v.Code == 429
+		if !ok || v.Code != 429 {
+			return false
+		}
+		if r.Request == nil || r.Request.RawRequest == nil || r.Request.RawRequest.Host != "x.com" {
+			return false
+		}
+		// Cloudflare 1015 是风控/限流，快速重试只会加重封锁，交给冷却熔断处理。
+		if strings.Contains(strings.ToLower(string(r.Body())), "error code: 1015") {
+			return false
+		}
+		return true
 	})
 
 	client.SetTransport(&http.Transport{
@@ -180,7 +204,7 @@ func (rl *xRateLimit) preRequest(ctx context.Context, nonBlocking bool) error {
 	}
 
 	if time.Now().After(rl.ResetTime) {
-		log.Debugln("[RateLimiter] Rate limit expired - path:", rl.Url)
+		log.Debugf("[rate-limit] Expired endpoint=%s", endpointForLog(rl.Url))
 		rl.Ready = false // 后续的请求等待本次请求完成更新速率限制
 		return nil
 	}
@@ -190,18 +214,20 @@ func (rl *xRateLimit) preRequest(ctx context.Context, nonBlocking bool) error {
 		return nil
 	} else {
 		if nonBlocking {
+			log.Debugf("[rate-limit] Would block endpoint=%s remaining=%d limit=%d reset_at=%s", endpointForLog(rl.Url), rl.Remaining, rl.Limit, rl.ResetTime.Format(time.RFC3339))
 			return ErrWouldBlock
 		}
 
 		insurance := 5 * time.Second
-		log.Warnf("[RateLimiter] Sleeping until: %s - path: %s", rl.ResetTime.Add(insurance), rl.Url)
+		wakeAt := rl.ResetTime.Add(insurance)
+		log.Warnf("[rate-limit] Sleeping endpoint=%s wake_at=%s remaining=%d limit=%d", endpointForLog(rl.Url), wakeAt.Format(time.RFC3339), rl.Remaining, rl.Limit)
 
 		origin, err := utils.GetConsoleTitle()
 		if err == nil {
-			utils.SetConsoleTitle(fmt.Sprintf("idle - sleeping until %v", rl.ResetTime.Add(insurance).Format(time.TimeOnly)))
+			utils.SetConsoleTitle(fmt.Sprintf("idle - sleeping until %v", wakeAt.Format(time.TimeOnly)))
 			defer utils.SetConsoleTitle(origin)
 		} else {
-			log.Warnf("[RateLimiter] Failed to set console title: %v", err)
+			log.Debugf("[rate-limit] Console title update failed error=%q", errorForLog(err))
 		}
 
 		select {
@@ -337,10 +363,16 @@ func (rateLimiter *rateLimiter) reset(url *url.URL, resp *resty.Response) {
 		// 请求成功，或发生了错误/触发了重试条件但有能力更新速率限制
 		rateLimit := makeRateLimit(resp)
 		rateLimiter.limits.Store(path, rateLimit)
+		if rateLimit != nil {
+			log.Debugf("[rate-limit] Updated endpoint=%s remaining=%d limit=%d reset_at=%s", endpointForLog(rateLimit.Url), rateLimit.Remaining, rateLimit.Limit, rateLimit.ResetTime.Format(time.RFC3339))
+		} else {
+			log.Debugf("[rate-limit] Disabled endpoint=%s reason=no_headers", endpointForLog(path))
+		}
 		cond.Broadcast()
 	} else {
 		// 将此路径设为首次请求前的状态
 		rateLimiter.limits.Delete(path)
+		log.Debugf("[rate-limit] Reset endpoint=%s reason=no_response", endpointForLog(path))
 		cond.Signal()
 	}
 }
@@ -420,7 +452,7 @@ func EnableRequestCounting(client *resty.Client) {
 func ReportRequestCount() {
 	apiCounts.Range(func(key, value any) bool {
 		if counter, ok := value.(*atomic.Int32); ok {
-			log.Debugf("[RateLimiter] * %s request count: %d", key, counter.Load())
+			log.Debugf("[rate-limit] Request count endpoint=%s count=%d", endpointForLog(fmt.Sprint(key)), counter.Load())
 		}
 		return true
 	})
@@ -467,7 +499,103 @@ func GetClientError(cli *resty.Client) error {
 func SetClientError(cli *resty.Client, err error) {
 	clientErrors.Store(cli, err)
 	if err != nil {
-		log.Debugln("[RateLimiter] Client no longer available:", GetClientScreenName(cli), "-", err)
+		log.Warnf("[twitter] Account unavailable account=%s error=%q", clientNameForLog(cli), errorForLog(err))
+	}
+}
+
+func parseRetryAfter(header string) time.Duration {
+	if secs, err := strconv.Atoi(strings.TrimSpace(header)); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	return defaultClientCooldown
+}
+
+func setClientCooldown(cli *resty.Client, d time.Duration) {
+	if cli == nil || d <= 0 {
+		return
+	}
+	until := time.Now().Add(d)
+	setClientCooldownUntil(cli, until)
+	log.Warnf("[twitter] Account cooldown account=%s until=%s dur=%s", clientNameForLog(cli), until.Format(time.RFC3339), d.Round(time.Second))
+}
+
+func setClientCooldownUntil(cli *resty.Client, until time.Time) {
+	if cli == nil {
+		return
+	}
+	if until.IsZero() {
+		clientCooldowns.Delete(cli)
+		return
+	}
+	clientCooldowns.Store(cli, until)
+}
+
+func clientInCooldown(cli *resty.Client) bool {
+	if cli == nil {
+		return false
+	}
+	v, ok := clientCooldowns.Load(cli)
+	if !ok {
+		return false
+	}
+	until := v.(time.Time)
+	if time.Now().Before(until) {
+		return true
+	}
+	clientCooldowns.Delete(cli)
+	return false
+}
+
+func allAdditionalInCooldown(additional []*resty.Client) bool {
+	if len(additional) == 0 {
+		return false
+	}
+	for _, cli := range additional {
+		if cli == nil {
+			continue
+		}
+		if !clientInCooldown(cli) {
+			return false
+		}
+	}
+	return true
+}
+
+func armGlobalCooldownIfIdle(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	now := time.Now()
+	globalCooldownMu.Lock()
+	if globalCooldownUntil.After(now) {
+		globalCooldownMu.Unlock()
+		return
+	}
+	globalCooldownUntil = now.Add(d)
+	globalCooldownMu.Unlock()
+	log.Warnf("[twitter] Global cooldown until=%s dur=%s", globalCooldownUntil.Format(time.RFC3339), d.Round(time.Second))
+}
+
+func setGlobalCooldownUntil(until time.Time) {
+	globalCooldownMu.Lock()
+	globalCooldownUntil = until
+	globalCooldownMu.Unlock()
+}
+
+func waitGlobalCooldown(ctx context.Context) error {
+	for {
+		globalCooldownMu.Lock()
+		until := globalCooldownUntil
+		globalCooldownMu.Unlock()
+		if until.IsZero() || !time.Now().Before(until) {
+			return nil
+		}
+		log.Debugf("[rate-limit] Global cooldown wait until=%s", until.Format(time.RFC3339))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Until(until)):
+		}
 	}
 }
 
@@ -478,68 +606,41 @@ func GetClientRateLimiter(cli *resty.Client) *rateLimiter {
 	return nil
 }
 
-var showStateToken = make(chan struct{}, 1)
-
-// 选择一个请求指定端点不会阻塞的客户端
-func SelectClient(ctx context.Context, clients []*resty.Client, path string) *resty.Client {
-	for ctx.Err() == nil {
-		errs := 0
-		for _, client := range clients {
-			if GetClientError(client) != nil {
-				errs++
-				continue
-			}
-
-			rl := GetClientRateLimiter(client)
-			if rl == nil || !rl.wouldBlock(path) {
-				return client
-			}
-		}
-
-		if errs == len(clients) {
-			return nil // no client available
-		}
-
-		select {
-		default:
-		case showStateToken <- struct{}{}:
-			defer func() { <-showStateToken }()
-			log.Warnf("[RateLimiter] Waiting for any client to wake up")
-			origin, err := utils.GetConsoleTitle()
-			if err == nil {
-				defer utils.SetConsoleTitle(origin)
-				utils.SetConsoleTitle("waiting for any client to wake up")
-			} else {
-				log.Debugln("[RateLimiter] Failed to get console title:", err)
-			}
-		}
-
-		select {
-		case <-ctx.Done():
-		case <-time.After(3 * time.Second):
-		}
-	}
-	return nil
-}
-
 // SelectClientMFQ 带指数退避的 MFQ 客户端选择
 // Q1: 只用附加账户（非受保护用户优先）
 // Q2: 附加账户 + 主账户 + 指数退避
 // Q3: 受保护用户 → 主账户独占（仅在已知用户信息时生效）
 func SelectClientMFQ(ctx context.Context, master *resty.Client, additional []*resty.Client, user *User, path string) *resty.Client {
+	if err := waitGlobalCooldown(ctx); err != nil {
+		return nil
+	}
+	// 只有全部附加账号都进入冷却/触发过限流时，才设置全局冷却；只在空闲时设置一次，避免被并发等待者反复顺延。
+	if allAdditionalInCooldown(additional) {
+		armGlobalCooldownIfIdle(defaultClientCooldown)
+	}
 	// Q3: 受保护用户 → 主账户独占（仅在已知用户信息时生效）
 	if user != nil && user.IsProtected {
+		log.Debugf("[rate-limit] Selected protected-user client endpoint=%s account=%s user=@%s", endpointForLog(path), clientNameForLog(master), user.ScreenName)
 		return master
 	}
 
-	// Q1: 只用附加账户
-	for _, cli := range additional {
-		if GetClientError(cli) != nil {
-			continue
-		}
-		rl := GetClientRateLimiter(cli)
-		if rl == nil || !rl.wouldBlock(path) {
-			return cli
+	// Q1: 顺序轮询附加账号，避免每次都把压力集中到第一个账号。
+	if len(additional) > 0 {
+		start := int(additionalClientCursor.Add(1)-1) % len(additional)
+		for i := 0; i < len(additional); i++ {
+			cli := additional[(start+i)%len(additional)]
+			if GetClientError(cli) != nil {
+				continue
+			}
+			if clientInCooldown(cli) {
+				log.Debugf("[rate-limit] Skipping cooling additional client endpoint=%s account=%s", endpointForLog(path), clientNameForLog(cli))
+				continue
+			}
+			rl := GetClientRateLimiter(cli)
+			if rl == nil || !rl.wouldBlock(path) {
+				log.Debugf("[rate-limit] Selected additional client endpoint=%s account=%s", endpointForLog(path), clientNameForLog(cli))
+				return cli
+			}
 		}
 	}
 
@@ -557,8 +658,14 @@ func SelectClientMFQ(ctx context.Context, master *resty.Client, additional []*re
 				errs++
 				continue
 			}
+			if clientInCooldown(cli) {
+				log.Debugf("[rate-limit] Skipping cooling fallback client endpoint=%s account=%s", endpointForLog(path), clientNameForLog(cli))
+				rateLimited++ // 冷却中的客户端视为临时限速，等待冷却结束
+				continue
+			}
 			rl := GetClientRateLimiter(cli)
 			if rl == nil || !rl.wouldBlock(path) {
+				log.Debugf("[rate-limit] Selected fallback client endpoint=%s account=%s backoff=%s", endpointForLog(path), clientNameForLog(cli), backoff)
 				return cli
 			}
 			rateLimited++ // 有客户端只是被限速，不是错误
@@ -566,18 +673,15 @@ func SelectClientMFQ(ctx context.Context, master *resty.Client, additional []*re
 
 		// 所有客户端都有错误，返回 nil
 		if errs == len(clients) {
+			log.Warnf("[rate-limit] No available clients endpoint=%s total=%d errors=%d", endpointForLog(path), len(clients), errs)
 			return nil
 		}
 
 		// 有客户端只是被限速，等待后重试
-		if rateLimited == 0 {
-			break
-		}
-
 		// 本轮全部失败，指数退避等待
 		log.Debugf(
-			"[MFQ] All clients blocked for path %s: rate_limited=%d, errors=%d, total=%d, backoff=%v",
-			path,
+			"[rate-limit] All clients blocked endpoint=%s rate_limited=%d errors=%d total=%d backoff=%s",
+			endpointForLog(path),
 			rateLimited,
 			errs,
 			len(clients),

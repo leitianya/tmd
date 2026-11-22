@@ -27,35 +27,35 @@ func TestTweetNaming_LogFormat(t *testing.T) {
 			text:     "比基尼",
 			tweetID:  1355100264760393735,
 			creator:  "吕布(QqiRru)",
-			expected: "[吕布(QqiRru)] 比基尼_1355100264760393735",
+			expected: "[吕布(QqiRru)] 比基尼 _1355100264760393735",
 		},
 		{
 			name:     "empty text",
 			text:     "",
 			tweetID:  123,
 			creator:  "test",
-			expected: "[test] tweet_123",
+			expected: "[test] tweet _123",
 		},
 		{
 			name:     "special chars",
 			text:     "hello\nworld",
 			tweetID:  456,
 			creator:  "user",
-			expected: "[user] hello world_456",
+			expected: "[user] hello world _456",
 		},
 		{
 			name:     "text with carriage return",
 			text:     "hello\r\nworld",
 			tweetID:  789,
 			creator:  "user",
-			expected: "[user] hello world_789",
+			expected: "[user] hello world _789",
 		},
 		{
 			name:     "text with tab",
 			text:     "hello\tworld",
 			tweetID:  101,
 			creator:  "user",
-			expected: "[user] hello\tworld_101",
+			expected: "[user] helloworld _101",
 		},
 		{
 			name:     "text with URL",
@@ -69,63 +69,70 @@ func TestTweetNaming_LogFormat(t *testing.T) {
 			text:     "test<>:\"/\\|?*file",
 			tweetID:  303,
 			creator:  "user",
-			expected: "[user] testfile_303",
+			expected: "[user] testfile _303",
 		},
 		{
 			name:     "unicode text",
 			text:     "🎉🎊🎁 庆祝活动 🎂🎈",
 			tweetID:  404,
 			creator:  "用户",
-			expected: "[用户] 🎉🎊🎁 庆祝活动 🎂🎈_404",
+			expected: "[用户] 🎉🎊🎁 庆祝活动 🎂🎈 _404",
 		},
 		{
 			name:     "very long text",
 			text:     strings.Repeat("a", 200),
 			tweetID:  505,
 			creator:  "user",
-			expected: "[user] " + strings.Repeat("a", testMaxFileNameLen-len("_505")-ExtReserveLen) + "_505",
+			expected: "[user] " + strings.Repeat("a", testMaxFileNameLen-len("_505")-ExtReserveLen) + " _505",
 		},
 		{
 			name:     "max tweetID",
 			text:     "test",
 			tweetID:  ^uint64(0),
 			creator:  "user",
-			expected: "[user] test_18446744073709551615",
+			expected: "[user] test _18446744073709551615",
 		},
 		{
 			name:     "zero tweetID",
 			text:     "test",
 			tweetID:  0,
 			creator:  "user",
-			expected: "[user] test_0",
+			expected: "[user] test _0",
 		},
 		{
 			name:     "empty creator",
 			text:     "test",
 			tweetID:  606,
 			creator:  "",
-			expected: "[] test_606",
+			expected: "[unknown] test _606",
+		},
+		{
+			name:     "creator is normalized to one line",
+			text:     "test",
+			tweetID:  607,
+			creator:  "User\r\n\tName",
+			expected: "[User Name] test _607",
 		},
 		{
 			name:     "creator with special chars",
 			text:     "test",
 			tweetID:  707,
 			creator:  "user<name>",
-			expected: "[user<name>] test_707",
+			expected: "[user<name>] test _707",
 		},
 		{
 			name:     "multiple newlines",
 			text:     "line1\nline2\nline3",
 			tweetID:  808,
 			creator:  "user",
-			expected: "[user] line1 line2 line3_808",
+			expected: "[user] line1 line2 line3 _808",
 		},
 		{
 			name:     "text with only whitespace",
 			text:     "   \n\t  ",
 			tweetID:  909,
 			creator:  "user",
-			expected: "[user]     \t  _909",
+			expected: "[user] tweet _909",
 		},
 	}
 
@@ -180,7 +187,7 @@ func TestTweetNaming_FileName(t *testing.T) {
 			text:     "file",
 			tweetID:  111,
 			ext:      ".",
-			expected: "file_111.",
+			expected: "file_111",
 		},
 		{
 			name:     "long extension",
@@ -188,6 +195,34 @@ func TestTweetNaming_FileName(t *testing.T) {
 			tweetID:  222,
 			ext:      ".tar.gz",
 			expected: "file_222.tar.gz",
+		},
+		{
+			name:     "twitter size suffix is not part of the extension",
+			text:     "file",
+			tweetID:  888,
+			ext:      ".jpg:large",
+			expected: "file_888.jpg",
+		},
+		{
+			name:     "video variant suffix is not part of the extension",
+			text:     "file",
+			tweetID:  889,
+			ext:      ".mp4:orig",
+			expected: "file_889.mp4",
+		},
+		{
+			name:     "query suffix terminates the extension",
+			text:     "file",
+			tweetID:  890,
+			ext:      ".jpg?tag=12",
+			expected: "file_890.jpg",
+		},
+		{
+			name:     "repeated variant suffixes keep the first extension only",
+			text:     "file",
+			tweetID:  891,
+			ext:      ".jpg:large:orig",
+			expected: "file_891.jpg",
 		},
 		{
 			name:     "text with path separator",
@@ -202,6 +237,62 @@ func TestTweetNaming_FileName(t *testing.T) {
 			tweetID:  444,
 			ext:      ".ext",
 			expected: "file.name.test_444.ext",
+		},
+		{
+			name:     "extension without leading dot",
+			text:     "file",
+			tweetID:  555,
+			ext:      "jpg",
+			expected: "file_555.jpg",
+		},
+		{
+			name:     "extension cannot create a subpath",
+			text:     "file",
+			tweetID:  666,
+			ext:      "../jpg",
+			expected: "file_666.jpg",
+		},
+		{
+			name:     "extension respects reserved budget",
+			text:     "file",
+			tweetID:  777,
+			ext:      ".abcdefghijk",
+			expected: "file_777.abcdefg",
+		},
+		{
+			name:     "trailing dot preserved for upgrade stability",
+			text:     "Hello world.",
+			tweetID:  1355100264760393735,
+			ext:      ".jpg",
+			expected: "Hello world._1355100264760393735.jpg",
+		},
+		{
+			name:     "trailing space preserved for upgrade stability",
+			text:     "Hello world ",
+			tweetID:  1355100264760393736,
+			ext:      ".jpg",
+			expected: "Hello world _1355100264760393736.jpg",
+		},
+		{
+			name:     "leading space preserved for upgrade stability",
+			text:     " hello",
+			tweetID:  1355100264760393737,
+			ext:      ".jpg",
+			expected: " hello_1355100264760393737.jpg",
+		},
+		{
+			name:     "tab control character removed",
+			text:     "a\tb",
+			tweetID:  1355100264760393738,
+			ext:      ".jpg",
+			expected: "ab_1355100264760393738.jpg",
+		},
+		{
+			name:     "reserved device name with tweet id is not prefixed",
+			text:     "CON",
+			tweetID:  1355100264760393739,
+			ext:      ".jpg",
+			expected: "CON_1355100264760393739.jpg",
 		},
 	}
 
@@ -308,6 +399,67 @@ func TestTweetNaming_FilePathWithResolver(t *testing.T) {
 	}
 }
 
+func TestTweetNaming_LegacyFileNamesCoverSupersededPolicies(t *testing.T) {
+	tn := NewTweetNaming("a\x01b", 123, "creator", testMaxFileNameLen)
+	names := tn.legacyFileNamesForPlatform(".jpg:large", false)
+
+	if !containsString(names, "ab_123.jpglarg") {
+		t.Fatalf("legacy candidates = %q, want deprecated collapsed extension", names)
+	}
+	if !containsString(names, "ab_123.jpg") {
+		t.Fatalf("legacy candidates = %q, want current normalized extension", names)
+	}
+	if !containsString(names, "a\x01b_123.jpg:large") {
+		t.Fatalf("legacy candidates = %q, want pre-hardening POSIX filename", names)
+	}
+	for _, name := range tn.legacyFileNamesForPlatform(".jpg:large", true) {
+		if strings.ContainsAny(name, ":\x01") {
+			t.Fatalf("Windows compatibility candidate must be addressable: %q", name)
+		}
+	}
+}
+
+func TestTweetNaming_LegacyFileNamesIncludePreviousVideoExtension(t *testing.T) {
+	tn := NewTweetNaming("video", 456, "creator", testMaxFileNameLen)
+	if !containsString(tn.LegacyFileNames(".m3u8"), "video_456.m3u8") {
+		t.Fatalf("legacy candidates = %q, want previous video extension", tn.LegacyFileNames(".m3u8"))
+	}
+}
+
+func TestNormalizeExtensionTerminatesAtUnsupportedRune(t *testing.T) {
+	tests := []struct {
+		ext    string
+		want   string
+		legacy string
+	}{
+		{ext: ".jpg:large", want: ".jpg", legacy: ".jpglarg"},
+		{ext: ".jpg", want: ".jpg", legacy: ".jpg"},
+		{ext: ".tar.gz", want: ".tar.gz", legacy: ".tar.gz"},
+		{ext: ".jpg?tag=12", want: ".jpg", legacy: ".jpgtag1"},
+		{ext: "../jpg", want: ".jpg", legacy: ".jpg"},
+		{ext: "", want: "", legacy: ""},
+		{ext: ".", want: "", legacy: ""},
+	}
+
+	for _, tt := range tests {
+		if got := normalizeExtension(tt.ext); got != tt.want {
+			t.Errorf("normalizeExtension(%q) = %q, want %q", tt.ext, got, tt.want)
+		}
+		if got := legacyNormalizeExtension(tt.ext); got != tt.legacy {
+			t.Errorf("legacyNormalizeExtension(%q) = %q, want %q", tt.ext, got, tt.legacy)
+		}
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestTweetNaming_baseName_Truncation(t *testing.T) {
 	// 测试文件名截断逻辑
 	tests := []struct {
@@ -381,13 +533,13 @@ func TestUserNaming_SanitizedTitle(t *testing.T) {
 			name:       "empty screenName",
 			userName:   "User",
 			screenName: "",
-			expected:   "User()",
+			expected:   "User",
 		},
 		{
 			name:       "both empty",
 			userName:   "",
 			screenName: "",
-			expected:   "()",
+			expected:   "user",
 		},
 		{
 			name:       "with special chars",
@@ -399,13 +551,13 @@ func TestUserNaming_SanitizedTitle(t *testing.T) {
 			name:       "with newlines",
 			userName:   "User\nName",
 			screenName: "screen\r\n",
-			expected:   "User Name(screen )",
+			expected:   "User Name(screen)",
 		},
 		{
 			name:       "with URL",
 			userName:   "User https://x.com/name",
 			screenName: "screen",
-			expected:   "User (screen)",
+			expected:   "User(screen)",
 		},
 		{
 			name:       "unicode names",
@@ -417,7 +569,7 @@ func TestUserNaming_SanitizedTitle(t *testing.T) {
 			name:       "very long names",
 			userName:   strings.Repeat("a", 100),
 			screenName: strings.Repeat("b", 100),
-			expected:   strings.Repeat("a", 100) + "(" + strings.Repeat("b", 57),
+			expected:   strings.Repeat("a", 56) + "(" + strings.Repeat("b", 100) + ")",
 		},
 		{
 			name:       "with path separators",
@@ -443,6 +595,30 @@ func TestUserNaming_SanitizedTitle(t *testing.T) {
 	}
 }
 
+func TestUserDirTitle_MatchesNewUserNaming(t *testing.T) {
+	// UserDirTitle 是 NewUserNaming().SanitizedTitle() 的统一入口，
+	// 必须与直接构造逐字节等价（含截断/清洗/屏幕名保留语义）。
+	cases := []struct {
+		name       string
+		userName   string
+		screenName string
+		maxLen     int
+	}{
+		{"plain", "Alice", "alice_1", testMaxFileNameLen},
+		{"path separators", "user/name", "screen\\name", 30},
+		{"unicode long", "🎉用户🎊", strings.Repeat("b", 50), 20},
+		{"empty screen name", "Bob", "", testMaxFileNameLen},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			want := NewUserNaming(tt.userName, tt.screenName, tt.maxLen).SanitizedTitle()
+			if got := UserDirTitle(tt.userName, tt.screenName, tt.maxLen); got != want {
+				t.Errorf("UserDirTitle() = %q, want %q (NewUserNaming equivalence)", got, want)
+			}
+		})
+	}
+}
+
 func TestUserNaming_Truncation(t *testing.T) {
 	// 测试长名称截断
 	const maxLen = 30
@@ -454,6 +630,24 @@ func TestUserNaming_Truncation(t *testing.T) {
 	got := un.SanitizedTitle()
 	if len(got) > maxLen {
 		t.Errorf("SanitizedTitle() length = %d, exceeds maxLen %d", len(got), maxLen)
+	}
+}
+
+func TestUserNaming_PreservesScreenNameIdentity(t *testing.T) {
+	const maxLen = 30
+	longName := strings.Repeat("same display name", 10)
+
+	first := NewUserNaming(longName, "account_one", maxLen).SanitizedTitle()
+	second := NewUserNaming(longName, "account_two", maxLen).SanitizedTitle()
+
+	if first == second {
+		t.Fatalf("distinct screen names produced the same directory name %q", first)
+	}
+	if !strings.HasSuffix(first, "(account_one)") {
+		t.Errorf("first title = %q, should preserve screen name", first)
+	}
+	if !strings.HasSuffix(second, "(account_two)") {
+		t.Errorf("second title = %q, should preserve screen name", second)
 	}
 }
 
@@ -483,7 +677,7 @@ func TestListNaming_SanitizedTitle(t *testing.T) {
 		{
 			name:     "empty title",
 			listBase: &mockListBase{id: 1, title: ""},
-			expected: "",
+			expected: "list(1)",
 		},
 		{
 			name:     "title with special chars",
@@ -498,7 +692,7 @@ func TestListNaming_SanitizedTitle(t *testing.T) {
 		{
 			name:     "title with URL",
 			listBase: &mockListBase{id: 4, title: "My List https://x.com/i/lists/123"},
-			expected: "My List ",
+			expected: "My List",
 		},
 		{
 			name:     "unicode title",
@@ -524,6 +718,11 @@ func TestListNaming_SanitizedTitle(t *testing.T) {
 			name:     "title with question mark",
 			listBase: &mockListBase{id: 9, title: "What? Why?"},
 			expected: "What Why",
+		},
+		{
+			name:     "title removed by sanitization",
+			listBase: &mockListBase{id: 11, title: "https://example.com/list"},
+			expected: "list(11)",
 		},
 		{
 			name:     "very long title",
@@ -567,6 +766,28 @@ func TestListNaming_Truncation(t *testing.T) {
 	}
 }
 
+func TestListNaming_PreservesExistingIDSuffix(t *testing.T) {
+	const maxLen = 30
+	list := &mockListBase{id: 42, title: strings.Repeat("a", 100) + "(42)"}
+
+	got := NewListNamingFromBase(list, maxLen).SanitizedTitle()
+	want := strings.Repeat("a", maxLen-len("(42)")) + "(42)"
+	if got != want {
+		t.Errorf("SanitizedTitle() = %q, want %q", got, want)
+	}
+}
+
+func TestListNaming_NilInputUsesFallback(t *testing.T) {
+	var typedNil *mockListBase
+
+	if got := NewListNamingFromBase(nil, 20).SanitizedTitle(); got != "list" {
+		t.Errorf("nil list title = %q, want %q", got, "list")
+	}
+	if got := NewListNamingFromBase(typedNil, 20).SanitizedTitle(); got != "list" {
+		t.Errorf("typed nil list title = %q, want %q", got, "list")
+	}
+}
+
 // ============================================================================
 // 边界条件测试
 // ============================================================================
@@ -584,27 +805,38 @@ func TestExtReserveLen(t *testing.T) {
 
 func TestTweetNaming_Concurrent(t *testing.T) {
 	tn := NewTweetNaming("test tweet", 12345, "testuser", testMaxFileNameLen)
+	// 串行基线：命名对象构造后不可变，并发调用必须与串行结果一致，
+	// 否则说明引入了共享可变状态（数据竞争）。
+	baseLog := tn.LogFormat()
+	baseName := tn.FileName(".jpg")
+	basePath, baseErr := tn.FilePath("temp", ".txt")
 
-	// 并发调用各种方法
 	done := make(chan bool, 3)
 
 	go func() {
 		for i := 0; i < 100; i++ {
-			_ = tn.LogFormat()
+			if got := tn.LogFormat(); got != baseLog {
+				t.Errorf("LogFormat() = %q, want %q", got, baseLog)
+			}
 		}
 		done <- true
 	}()
 
 	go func() {
 		for i := 0; i < 100; i++ {
-			_ = tn.FileName(".jpg")
+			if got := tn.FileName(".jpg"); got != baseName {
+				t.Errorf("FileName() = %q, want %q", got, baseName)
+			}
 		}
 		done <- true
 	}()
 
 	go func() {
 		for i := 0; i < 100; i++ {
-			_, _ = tn.FilePath("temp", ".txt")
+			got, err := tn.FilePath("temp", ".txt")
+			if err != baseErr || got != basePath {
+				t.Errorf("FilePath() = %q,%v want %q,%v", got, err, basePath, baseErr)
+			}
 		}
 		done <- true
 	}()
@@ -616,19 +848,24 @@ func TestTweetNaming_Concurrent(t *testing.T) {
 
 func TestUserNaming_Concurrent(t *testing.T) {
 	un := NewUserNaming("User", "screen", testMaxFileNameLen)
+	base := un.SanitizedTitle()
 
 	done := make(chan bool, 2)
 
 	go func() {
 		for i := 0; i < 100; i++ {
-			_ = un.SanitizedTitle()
+			if got := un.SanitizedTitle(); got != base {
+				t.Errorf("SanitizedTitle() = %q, want %q", got, base)
+			}
 		}
 		done <- true
 	}()
 
 	go func() {
 		for i := 0; i < 100; i++ {
-			_ = un.SanitizedTitle()
+			if got := un.SanitizedTitle(); got != base {
+				t.Errorf("SanitizedTitle() = %q, want %q", got, base)
+			}
 		}
 		done <- true
 	}()
@@ -640,19 +877,24 @@ func TestUserNaming_Concurrent(t *testing.T) {
 
 func TestListNaming_Concurrent(t *testing.T) {
 	ln := NewListNamingFromBase(&mockListBase{id: 1, title: "Test List"}, testMaxFileNameLen)
+	base := ln.SanitizedTitle()
 
 	done := make(chan bool, 2)
 
 	go func() {
 		for i := 0; i < 100; i++ {
-			_ = ln.SanitizedTitle()
+			if got := ln.SanitizedTitle(); got != base {
+				t.Errorf("SanitizedTitle() = %q, want %q", got, base)
+			}
 		}
 		done <- true
 	}()
 
 	go func() {
 		for i := 0; i < 100; i++ {
-			_ = ln.SanitizedTitle()
+			if got := ln.SanitizedTitle(); got != base {
+				t.Errorf("SanitizedTitle() = %q, want %q", got, base)
+			}
 		}
 		done <- true
 	}()
@@ -767,5 +1009,23 @@ func BenchmarkNewTweetNaming(b *testing.B) {
 func BenchmarkNewUserNaming(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_ = NewUserNaming("Name", "screen", testMaxFileNameLen)
+	}
+}
+
+// TestUserNaming_NonPositiveMaxLen 守护 TruncateUTF8 迁移后的负值/零值守卫：
+// 旧命名包私有 truncateUTF8 有 maxLen<=0 返回空串的守卫，迁移到
+// utils.TruncateUTF8 后该契约必须保持（负值不得 panic）。
+func TestUserNaming_NonPositiveMaxLen(t *testing.T) {
+	if got := NewUserNaming("", "", 0).SanitizedTitle(); got != "" {
+		t.Errorf("NewUserNaming(maxLen=0) = %q, want empty", got)
+	}
+	if got := NewUserNaming("", "", -1).SanitizedTitle(); got != "" {
+		t.Errorf("NewUserNaming(maxLen=-1) = %q, want empty (no panic)", got)
+	}
+	if got := UserDirTitle("", "", 0); got != "" {
+		t.Errorf("UserDirTitle(maxLen=0) = %q, want empty", got)
+	}
+	if got := UserDirTitle("", "", -1); got != "" {
+		t.Errorf("UserDirTitle(maxLen=-1) = %q, want empty (no panic)", got)
 	}
 }

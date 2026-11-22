@@ -116,15 +116,15 @@ func (s *eventSubscriber) nextEvent() (SSEEvent, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-		if len(s.queue) > 0 {
-			evt := s.queue[0]
-			s.queue[0] = SSEEvent{}
-			s.queue = s.queue[1:]
-			if len(s.queue) == 0 {
-				s.queue = nil
-			}
-			return evt, true
+	if len(s.queue) > 0 {
+		evt := s.queue[0]
+		s.queue[0] = SSEEvent{}
+		s.queue = s.queue[1:]
+		if len(s.queue) == 0 {
+			s.queue = nil
 		}
+		return evt, true
+	}
 
 	for _, eventName := range coalescedSSEEvents {
 		if evt, ok := s.latest[eventName]; ok {
@@ -172,6 +172,7 @@ type EventBus struct {
 	subscribers   map[*eventSubscriber]struct{}
 	nextEventID   uint64
 	replayHistory []SSEEvent
+	closed        bool
 }
 
 func NewEventBus() *EventBus {
@@ -185,6 +186,10 @@ func NewEventBus() *EventBus {
 func (b *EventBus) Close() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.closed {
+		return
+	}
+	b.closed = true
 	for sub := range b.subscribers {
 		sub.close()
 	}
@@ -199,6 +204,11 @@ func (b *EventBus) Subscribe() (<-chan SSEEvent, func()) {
 func (b *EventBus) SubscribeWithReplay(lastEventID uint64) (<-chan SSEEvent, []SSEEvent, func()) {
 	sub := newEventSubscriber()
 	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		sub.close()
+		return sub.ch, nil, func() {}
+	}
 	replay := b.copyReplayAfterLocked(lastEventID)
 	b.subscribers[sub] = struct{}{}
 	b.mu.Unlock()
@@ -235,11 +245,15 @@ func (b *EventBus) Publish(event string, data interface{}) {
 	// 预序列化：一份 JSON 字节切片供所有订阅者共享，避免 N 个订阅者重复 json.Marshal
 	raw, err := json.Marshal(data)
 	if err != nil {
-		log.Warnf("[SSE] Failed to marshal event %s: %v", event, err)
+		log.Warnf("[sse] Event marshal failed event=%s error=%q", event, err.Error())
 		return
 	}
 
 	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return
+	}
 	b.nextEventID++
 	evt := SSEEvent{ID: b.nextEventID, Event: event, Data: data, Raw: raw}
 	if isReplayableSSEEvent(event) {
@@ -274,9 +288,8 @@ func (b *EventBus) Publish(event string, data interface{}) {
 	}
 	b.mu.Unlock()
 
-	log.Warnf("[SSE] Closing %d slow subscriber(s) after %s event queue overflow", len(overflowed), event)
+	log.Warnf("[sse] Slow subscribers closed count=%d event=%s reason=queue_overflow", len(overflowed), event)
 }
-
 
 func (b *EventBus) PublishNotification(notifType, message string, detail interface{}) {
 	b.Publish("notification", map[string]interface{}{

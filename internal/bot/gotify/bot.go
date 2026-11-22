@@ -22,18 +22,22 @@ type Bot struct {
 	logHub   *consolelog.Hub
 	client   *http.Client
 
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	notifiedTasks map[string]struct{}
+	mu            sync.Mutex
+	stopCh        chan struct{}
+	wg            sync.WaitGroup
+	stopOnce      sync.Once
 }
 
 // NewBot 创建 Gotify bot 实例
 func NewBot(cfg *config.GotifyBotConfig, eb *api.EventBus, lh *consolelog.Hub) *Bot {
 	return &Bot{
-		config:   cfg,
-		eventBus: eb,
-		logHub:   lh,
-		client:   &http.Client{Timeout: 10 * time.Second},
-		stopCh:   make(chan struct{}),
+		config:        cfg,
+		eventBus:      eb,
+		logHub:        lh,
+		client:        &http.Client{Timeout: 10 * time.Second},
+		notifiedTasks: make(map[string]struct{}),
+		stopCh:        make(chan struct{}),
 	}
 }
 
@@ -44,14 +48,16 @@ func (b *Bot) Start() error {
 	if b.logHub != nil {
 		api.RunBotLogLoop(b.logHub, b.stopCh, &b.wg, b.sendLogAlert)
 	}
-	log.Infof("[bot-gotify] Started (server: %s)", b.config.ServerURL)
+	log.Infof("[bot-gotify] Started server=%s", strings.TrimRight(b.config.ServerURL, "/"))
 	return nil
 }
 
 // Stop 停止 bot。
 func (b *Bot) Stop() {
-	close(b.stopCh)
-	b.wg.Wait()
+	b.stopOnce.Do(func() {
+		close(b.stopCh)
+		b.wg.Wait()
+	})
 }
 
 // Name 返回 bot 名称
@@ -62,10 +68,35 @@ func (b *Bot) notifyTaskChanges(data interface{}) {
 	if !ok {
 		return
 	}
+	var pending []*api.Task
+	b.mu.Lock()
+	if b.notifiedTasks == nil {
+		b.notifiedTasks = make(map[string]struct{})
+	}
+	// 事件里是当前任务的全量快照，快照外的任务已过期或删除：清掉它们的
+	// 已通知标记，避免这张 map 随进程运行无限增长。
+	live := make(map[string]struct{}, len(tasks))
+	for _, task := range tasks {
+		live[task.ID] = struct{}{}
+	}
+	for id := range b.notifiedTasks {
+		if _, ok := live[id]; !ok {
+			delete(b.notifiedTasks, id)
+		}
+	}
 	for _, task := range tasks {
 		if task.Status != api.TaskStatusCompleted && task.Status != api.TaskStatusFailed {
 			continue
 		}
+		if _, ok := b.notifiedTasks[task.ID]; ok {
+			continue
+		}
+		b.notifiedTasks[task.ID] = struct{}{}
+		pending = append(pending, task)
+	}
+	b.mu.Unlock()
+
+	for _, task := range pending {
 		title := "❌ TMD Download Failed"
 		if task.Status == api.TaskStatusCompleted {
 			title = "✅ TMD Download Complete"
@@ -98,7 +129,7 @@ func (b *Bot) sendNotification(title, message string) {
 	url := strings.TrimRight(b.config.ServerURL, "/") + "/message"
 	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
-		log.Warnf("[bot-gotify] Failed to create request: %v", err)
+		log.Warnf("[bot-gotify] Create request failed error=%q", err.Error())
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -106,11 +137,11 @@ func (b *Bot) sendNotification(title, message string) {
 
 	resp, err := b.client.Do(req)
 	if err != nil {
-		log.Warnf("[bot-gotify] Failed to send: %v", err)
+		log.Warnf("[bot-gotify] Send notification failed error=%q", err.Error())
 		return
 	}
 	resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		log.Warnf("[bot-gotify] Gotify returned %d", resp.StatusCode)
+		log.Warnf("[bot-gotify] Send notification failed status=%d", resp.StatusCode)
 	}
 }

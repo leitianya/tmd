@@ -3,6 +3,7 @@ package downloading
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/unkmonster/tmd/internal/config"
 	"github.com/unkmonster/tmd/internal/downloader"
@@ -42,8 +43,9 @@ type userInListEntity struct {
 }
 
 type RuntimeOptions struct {
-	MaxDownloadRoutine int
-	MaxFileNameLen     int
+	MaxDownloadRoutine     int
+	MaxUserFetchConcurrent int
+	MaxFileNameLen         int
 }
 
 func (o RuntimeOptions) normalizedMaxDownloadRoutine() int {
@@ -51,6 +53,13 @@ func (o RuntimeOptions) normalizedMaxDownloadRoutine() int {
 		return o.MaxDownloadRoutine
 	}
 	return config.DefaultMaxDownloadRoutine()
+}
+
+func (o RuntimeOptions) normalizedMaxUserFetchConcurrent() int {
+	if o.MaxUserFetchConcurrent > 0 {
+		return o.MaxUserFetchConcurrent
+	}
+	return config.DefaultMaxUserFetchConcurrent()
 }
 
 func (o RuntimeOptions) normalizedMaxFileNameLen() int {
@@ -96,16 +105,22 @@ func (s *batchSyncState) markListUser(listEntityID int, userID uint64) bool {
 }
 
 type workerConfig struct {
-	ctx            context.Context
-	wg             *sync.WaitGroup
-	cancel         context.CancelCauseFunc
-	skipLoongTweet bool
-	downloader     downloader.Downloader
-	fileWriter     downloader.FileWriter
-	onTweetDone    func(pt PackagedTweet, failed bool)
-	pathResolver   *utils.UniquePathResolver
-	maxFileNameLen int
+	ctx                  context.Context
+	wg                   *sync.WaitGroup
+	cancel               context.CancelCauseFunc
+	skipLoongTweet       bool
+	downloader           downloader.Downloader
+	fileWriter           downloader.FileWriter
+	onTweetDone          func(pt PackagedTweet, failed bool)
+	pathResolver         *utils.UniquePathResolver
+	legacyMediaIndexOnce sync.Once
+	legacyMediaIndex     *legacyMediaPathIndex
+	maxFileNameLen       int
 }
 
 const userTweetRateLimit = 1500
-const userTweetMaxConcurrent = 35
+const listCollectMaxConcurrent = 3
+const maxUserFetchRetries = 2
+
+// userFetchRetryDelay 用 var 而不是 const，便于端到端测试临时缩短重试等待。
+var userFetchRetryDelay = 60 * time.Second

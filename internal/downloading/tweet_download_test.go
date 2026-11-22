@@ -1,29 +1,47 @@
 package downloading
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/gookit/color"
+	log "github.com/sirupsen/logrus"
 	"github.com/unkmonster/tmd/internal/downloader"
+	"github.com/unkmonster/tmd/internal/logging"
+	"github.com/unkmonster/tmd/internal/naming"
 	"github.com/unkmonster/tmd/internal/twitter"
 	"github.com/unkmonster/tmd/internal/utils"
 )
 
-type mockTweetFileWriter struct {
-	result downloader.WriteResult
-	err    error
-}
-
-func (m *mockTweetFileWriter) Write(req downloader.WriteRequest) (downloader.WriteResult, error) {
-	return m.result, m.err
+func captureTweetDownloadLog(t *testing.T, fn func()) string {
+	t.Helper()
+	var buf bytes.Buffer
+	originalOutput := log.StandardLogger().Out
+	originalFormatter := log.StandardLogger().Formatter
+	originalLevel := log.StandardLogger().Level
+	log.SetOutput(&buf)
+	log.SetFormatter(&log.TextFormatter{DisableTimestamp: true, ForceColors: true})
+	log.SetLevel(log.InfoLevel)
+	t.Cleanup(func() {
+		log.SetOutput(originalOutput)
+		log.SetFormatter(originalFormatter)
+		log.SetLevel(originalLevel)
+	})
+	fn()
+	return buf.String()
 }
 
 type mockTweetDownloader struct {
-	results map[string]mockTweetDownloadResult
+	results  map[string]mockTweetDownloadResult
+	requests []downloader.DownloadRequest
 }
 
 type mockTweetDownloadResult struct {
@@ -32,6 +50,7 @@ type mockTweetDownloadResult struct {
 }
 
 func (m *mockTweetDownloader) Download(req downloader.DownloadRequest) (*downloader.DownloadResult, error) {
+	m.requests = append(m.requests, req)
 	if m.results == nil {
 		return &downloader.DownloadResult{Success: true}, nil
 	}
@@ -39,6 +58,288 @@ func (m *mockTweetDownloader) Download(req downloader.DownloadRequest) (*downloa
 		return result.result, result.err
 	}
 	return &downloader.DownloadResult{Success: true}, nil
+}
+
+func TestDownloadTweetMedia_PassesTweetIDLogField(t *testing.T) {
+	tempDir := t.TempDir()
+	rawURL := "https://example.com/media.jpg"
+	tweet := &twitter.Tweet{
+		Id:        2082145690277327224,
+		Text:      "tweet",
+		Urls:      []string{rawURL},
+		CreatedAt: time.Now(),
+		Creator: &twitter.User{
+			Name:       "alice",
+			ScreenName: "alice",
+		},
+	}
+	mock := &mockTweetDownloader{}
+	cfg := &workerConfig{
+		ctx:        context.Background(),
+		downloader: mock,
+	}
+
+	err := downloadTweetMedia(cfg, tempDir, tweet, true)
+	if err != nil {
+		t.Fatalf("downloadTweetMedia() unexpected error: %v", err)
+	}
+	if len(mock.requests) != 1 {
+		t.Fatalf("Download called %d times, want 1", len(mock.requests))
+	}
+	if got := mock.requests[0].LogFields["tweet_id"]; got != tweet.Id {
+		t.Fatalf("tweet_id log field = %#v, want %d", got, tweet.Id)
+	}
+}
+
+func TestDownloadTweetMedia_ReusesLegacyVideoVariantName(t *testing.T) {
+	tempDir := t.TempDir()
+	const tweetID = uint64(1000000000000000001)
+	currentURL := "https://example.invalid/current.mp4"
+	legacyURL := "https://example.invalid/playlist.m3u8"
+	tweet := &twitter.Tweet{
+		Id:         tweetID,
+		Text:       "video",
+		Urls:       []string{currentURL},
+		LegacyURLs: []string{legacyURL},
+		CreatedAt:  time.Now(),
+		Creator:    &twitter.User{Name: "alice", ScreenName: "alice"},
+	}
+	legacyName := naming.NewTweetNaming(tweet.Text, tweet.Id, tweet.Creator.Title(), utils.DefaultMaxFileNameLen).FileName(".m3u8")
+	legacyPath := filepath.Join(tempDir, legacyName)
+	if err := os.WriteFile(legacyPath, []byte("already downloaded"), 0600); err != nil {
+		t.Fatalf("write legacy media: %v", err)
+	}
+
+	mock := &mockTweetDownloader{}
+	err := downloadTweetMedia(&workerConfig{
+		ctx:            context.Background(),
+		downloader:     mock,
+		pathResolver:   utils.NewUniquePathResolver(),
+		maxFileNameLen: utils.DefaultMaxFileNameLen,
+	}, tempDir, tweet, true)
+
+	if err != nil {
+		t.Fatalf("downloadTweetMedia() unexpected error: %v", err)
+	}
+	if got := len(mock.requests); got != 0 {
+		t.Fatalf("Download called %d times, want 0 after legacy reuse", got)
+	}
+	if len(tweet.Urls) != 0 || len(tweet.LegacyURLs) != 0 {
+		t.Fatalf("completed tweet should not remain retryable: urls=%v legacy=%v", tweet.Urls, tweet.LegacyURLs)
+	}
+	if _, statErr := os.Stat(legacyPath); statErr != nil {
+		t.Fatalf("legacy media should remain untouched: %v", statErr)
+	}
+}
+
+func TestDownloadTweetMedia_ReusesLegacyVideoVariantWithSameExtension(t *testing.T) {
+	tempDir := t.TempDir()
+	const tweetID = uint64(1000000000000000004)
+	currentURL := "https://example.invalid/high-bitrate.mp4"
+	legacyURL := "https://example.invalid/low-bitrate.mp4"
+	tweet := &twitter.Tweet{
+		Id:         tweetID,
+		Text:       "video",
+		Urls:       []string{currentURL},
+		LegacyURLs: []string{legacyURL},
+		CreatedAt:  time.Now(),
+		Creator:    &twitter.User{Name: "alice", ScreenName: "alice"},
+	}
+	currentName := naming.NewTweetNaming(tweet.Text, tweet.Id, tweet.Creator.Title(), utils.DefaultMaxFileNameLen).FileName(".mp4")
+	if err := os.WriteFile(filepath.Join(tempDir, currentName), []byte("legacy bitrate"), 0600); err != nil {
+		t.Fatalf("write same-extension legacy media: %v", err)
+	}
+
+	mock := &mockTweetDownloader{}
+	err := downloadTweetMedia(&workerConfig{
+		ctx:            context.Background(),
+		downloader:     mock,
+		pathResolver:   utils.NewUniquePathResolver(),
+		maxFileNameLen: utils.DefaultMaxFileNameLen,
+	}, tempDir, tweet, true)
+
+	if err != nil {
+		t.Fatalf("downloadTweetMedia() unexpected error: %v", err)
+	}
+	if got := len(mock.requests); got != 0 {
+		t.Fatalf("Download called %d times, want 0 after same-extension legacy reuse", got)
+	}
+}
+
+func TestDownloadTweetMedia_ReusesPreHardeningPOSIXName(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows cannot address historical colon/control-character filenames")
+	}
+	tempDir := t.TempDir()
+	tweet := &twitter.Tweet{
+		Id:        1000000000000000002,
+		Text:      "a\x01b",
+		Urls:      []string{"https://example.invalid/photo.jpg:large"},
+		CreatedAt: time.Now(),
+		Creator:   &twitter.User{Name: "alice", ScreenName: "alice"},
+	}
+	tn := naming.NewTweetNaming(tweet.Text, tweet.Id, tweet.Creator.Title(), utils.DefaultMaxFileNameLen)
+	var legacyName string
+	for _, candidate := range tn.LegacyFileNames(".jpg:large") {
+		if strings.Contains(candidate, "\x01") && strings.Contains(candidate, ":") {
+			legacyName = candidate
+			break
+		}
+	}
+	if legacyName == "" {
+		t.Fatalf("missing pre-hardening candidate: %q", tn.LegacyFileNames(".jpg:large"))
+	}
+	legacyPath := filepath.Join(tempDir, legacyName)
+	if err := os.WriteFile(legacyPath, []byte("already downloaded"), 0600); err != nil {
+		t.Fatalf("write legacy media: %v", err)
+	}
+
+	mock := &mockTweetDownloader{}
+	err := downloadTweetMedia(&workerConfig{
+		ctx:            context.Background(),
+		downloader:     mock,
+		pathResolver:   utils.NewUniquePathResolver(),
+		maxFileNameLen: utils.DefaultMaxFileNameLen,
+	}, tempDir, tweet, true)
+
+	if err != nil {
+		t.Fatalf("downloadTweetMedia() unexpected error: %v", err)
+	}
+	if got := len(mock.requests); got != 0 {
+		t.Fatalf("Download called %d times, want 0 after legacy reuse", got)
+	}
+}
+
+func TestFindExistingLegacyMediaPathUsesEachCollisionOnce(t *testing.T) {
+	tempDir := t.TempDir()
+	for _, name := range []string{"tweet_1.m3u8", "tweet_1(1).m3u8"} {
+		if err := os.WriteFile(filepath.Join(tempDir, name), []byte(name), 0600); err != nil {
+			t.Fatalf("write %q: %v", name, err)
+		}
+	}
+	used := make(map[string]struct{})
+	index := newLegacyMediaPathIndex()
+	first, found, err := index.findExistingLegacyMediaPath(tempDir, "tweet_1.m3u8", used)
+	if err != nil || !found {
+		t.Fatalf("first legacy media = %q found=%v err=%v", first, found, err)
+	}
+	used[legacyMediaPathKey(first)] = struct{}{}
+	second, found, err := index.findExistingLegacyMediaPath(tempDir, "tweet_1.m3u8", used)
+	if err != nil || !found {
+		t.Fatalf("second legacy media = %q found=%v err=%v", second, found, err)
+	}
+	if filepath.Base(first) != "tweet_1.m3u8" || filepath.Base(second) != "tweet_1(1).m3u8" {
+		t.Fatalf("legacy collision order = %q, %q", first, second)
+	}
+}
+
+func TestLegacyMediaPathIndexScansEachDirectoryOnce(t *testing.T) {
+	tempDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tempDir, "tweet_1(1).m3u8"), []byte("already downloaded"), 0600); err != nil {
+		t.Fatalf("write collision media: %v", err)
+	}
+	index := newLegacyMediaPathIndex()
+	readCalls := 0
+	index.readDir = func(dir string) ([]os.DirEntry, error) {
+		readCalls++
+		return os.ReadDir(dir)
+	}
+
+	first, found, err := index.findExistingLegacyMediaPath(tempDir, "tweet_1.m3u8", nil)
+	if err != nil || !found || filepath.Base(first) != "tweet_1(1).m3u8" {
+		t.Fatalf("first compatibility lookup = %q found=%v err=%v", first, found, err)
+	}
+	_, found, err = index.findExistingLegacyMediaPath(tempDir, "missing.m3u8", nil)
+	if err != nil || found {
+		t.Fatalf("second compatibility lookup found=%v err=%v", found, err)
+	}
+	if readCalls != 1 {
+		t.Fatalf("directory scans = %d, want 1", readCalls)
+	}
+}
+
+func TestTweetMediaSummaryFields_OmitsCleanSuccessCounts(t *testing.T) {
+	got := tweetMediaSummaryFields(1, 0, 0, 1)
+	if strings.Contains(got, "\x1b[") {
+		t.Fatalf("clean success summary should not color count fields, got: %q", got)
+	}
+	if got != "" {
+		t.Fatalf("summary = %q", got)
+	}
+}
+
+func TestTweetMediaSummaryFields_HighlightsIncompleteDownload(t *testing.T) {
+	oldEnable := color.Enable
+	oldLevel := color.ForceSetColorLevel(color.Level16)
+	color.Enable = true
+	t.Cleanup(func() {
+		color.Enable = oldEnable
+		color.ForceSetColorLevel(oldLevel)
+	})
+
+	got := tweetMediaSummaryFields(1, 1, 1, 3)
+	if !strings.Contains(got, "\x1b[") {
+		t.Fatalf("incomplete summary should color result fields, got: %q", got)
+	}
+	stripped := logging.StripANSI(got)
+	if stripped != "succeeded=1 failed=1 skipped=1 total=3" {
+		t.Fatalf("stripped summary = %q", stripped)
+	}
+}
+
+func TestTweetMediaSummaryFields_RespectsDisabledColor(t *testing.T) {
+	oldEnable := color.Disable()
+	t.Cleanup(func() { color.Enable = oldEnable })
+
+	got := tweetMediaSummaryFields(1, 1, 1, 3)
+
+	if strings.Contains(got, "\x1b[") {
+		t.Fatalf("disabled color should produce plain summary fields, got: %q", got)
+	}
+	if got != "succeeded=1 failed=1 skipped=1 total=3" {
+		t.Fatalf("summary = %q", got)
+	}
+}
+
+func TestDownloadTweetMedia_CompleteLogOmitsRedundantEventPhrase(t *testing.T) {
+	tempDir := t.TempDir()
+	tweet := &twitter.Tweet{
+		Id:        2082192002397925511,
+		Text:      "golden hour",
+		Urls:      []string{"https://example.com/success.jpg"},
+		CreatedAt: time.Now(),
+		Creator: &twitter.User{
+			Name:       "Jade Vow",
+			ScreenName: "JadeVow",
+		},
+	}
+
+	cfg := &workerConfig{
+		ctx:            context.Background(),
+		downloader:     &mockTweetDownloader{},
+		maxFileNameLen: 200,
+	}
+
+	output := captureTweetDownloadLog(t, func() {
+		_ = downloadTweetMedia(cfg, tempDir, tweet, true)
+	})
+
+	stripped := logging.StripANSI(output)
+	if strings.Contains(stripped, "Tweet media complete") {
+		t.Fatalf("summary log should omit redundant event phrase, got: %s", stripped)
+	}
+	if strings.Contains(stripped, "title=") {
+		t.Fatalf("summary log should omit title field label, got: %s", stripped)
+	}
+	if strings.Contains(stripped, "succeeded=") || strings.Contains(stripped, "failed=") || strings.Contains(stripped, "skipped=") || strings.Contains(stripped, "total=") {
+		t.Fatalf("clean success summary should omit all count fields, got: %s", stripped)
+	}
+	if strings.Contains(stripped, `"[Jade Vow(JadeVow)] golden hour _2082192002397925511"`) {
+		t.Fatalf("summary log should omit outer title quotes, got: %s", stripped)
+	}
+	if !strings.Contains(stripped, `[Jade Vow(JadeVow)] golden hour _2082192002397925511`) {
+		t.Fatalf("summary log should preserve readable title, got: %s", stripped)
+	}
 }
 
 type panicTweetDownloader struct{}
@@ -234,33 +535,6 @@ func TestBatchDownloadTweet_Empty(t *testing.T) {
 		t.Errorf("BatchDownloadTweet() with empty input = %v, want nil", result)
 	}
 }
-
-func TestBatchDownloadTweet_WithTweets(t *testing.T) {
-	ctx := context.Background()
-
-	tweets := []PackagedTweet{
-		&TweetInEntity{
-			Tweet: &twitter.Tweet{
-				Id:        1,
-				Text:      "Test tweet",
-				Urls:      []string{"http://example.com/image.jpg"},
-				CreatedAt: time.Now(),
-			},
-			Entity: nil,
-		},
-	}
-
-	// This will fail because we don't have real downloader/fileWriter
-	// but it tests the function signature and basic flow
-	defer func() {
-		if r := recover(); r != nil {
-			t.Logf("BatchDownloadTweet panicked as expected: %v", r)
-		}
-	}()
-
-	_ = BatchDownloadTweet(ctx, nil, false, nil, nil, RuntimeOptions{}, nil, tweets...)
-}
-
 func TestBatchDownloadTweet_ReportsFailedTweet(t *testing.T) {
 	ctx := context.Background()
 	var called bool
@@ -426,11 +700,13 @@ func TestDownloadTweetMedia_SkipsNonRetriableStatus(t *testing.T) {
 func TestDownloadTweetMedia_RetainsRetryableUrlsOnly(t *testing.T) {
 	tempDir := t.TempDir()
 	retryableURL := "https://example.com/500.jpg"
+	legacyRetryableURL := "https://example.com/old-500.m3u8"
 	tweet := &twitter.Tweet{
-		Id:        2,
-		Text:      "tweet",
-		Urls:      []string{"https://example.com/404.jpg", retryableURL, "https://example.com/success.jpg"},
-		CreatedAt: time.Now(),
+		Id:         2,
+		Text:       "tweet",
+		Urls:       []string{"https://example.com/404.jpg", retryableURL, "https://example.com/success.jpg"},
+		LegacyURLs: []string{"https://example.com/old-404.jpg", legacyRetryableURL, "https://example.com/old-success.jpg"},
+		CreatedAt:  time.Now(),
 		Creator: &twitter.User{
 			Name:       "bob",
 			ScreenName: "bob",
@@ -463,6 +739,48 @@ func TestDownloadTweetMedia_RetainsRetryableUrlsOnly(t *testing.T) {
 	}
 	if len(tweet.Urls) != 1 || tweet.Urls[0] != retryableURL {
 		t.Fatalf("tweet.Urls 只应保留可重试 URL，got %v", tweet.Urls)
+	}
+	if len(tweet.LegacyURLs) != 1 || tweet.LegacyURLs[0] != legacyRetryableURL {
+		t.Fatalf("tweet.LegacyURLs must retain the matching retry alias, got %v", tweet.LegacyURLs)
+	}
+}
+
+func TestDownloadTweetMedia_LogSanitizesURL(t *testing.T) {
+	tempDir := t.TempDir()
+	rawURL := "https://example.com/500.jpg?token=secret-token&name=orig"
+	tweet := &twitter.Tweet{
+		Id:        5,
+		Text:      "tweet",
+		Urls:      []string{rawURL},
+		CreatedAt: time.Now(),
+		Creator: &twitter.User{
+			Name:       "erin",
+			ScreenName: "erin",
+		},
+	}
+
+	cfg := &workerConfig{
+		ctx: context.Background(),
+		downloader: &mockTweetDownloader{results: map[string]mockTweetDownloadResult{
+			rawURL: {
+				result: &downloader.DownloadResult{},
+				err:    &utils.HttpStatusError{Code: 500, Msg: "token=secret-token"},
+			},
+		}},
+	}
+
+	output := captureTweetDownloadLog(t, func() {
+		_ = downloadTweetMedia(cfg, tempDir, tweet, true)
+	})
+
+	if strings.Contains(output, "secret-token") {
+		t.Fatalf("media log leaked sensitive URL query or error text: %s", output)
+	}
+	if !strings.Contains(output, "[download] Failed media") {
+		t.Fatalf("media log should include failure message, got: %s", output)
+	}
+	if !strings.Contains(output, "name=orig") {
+		t.Fatalf("media log should preserve non-sensitive query context, got: %s", output)
 	}
 }
 

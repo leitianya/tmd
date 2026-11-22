@@ -3,6 +3,7 @@ package database
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -25,9 +26,16 @@ func CreateUserEntity(db *sqlx.DB, entity *UserEntity) error {
 
 func DelUserEntity(db *sqlx.DB, id uint32) error {
 	stmt := `DELETE FROM user_entities WHERE id=?`
-	_, err := db.Exec(stmt, id)
+	result, err := db.Exec(stmt, id)
 	if err != nil {
 		return fmt.Errorf("failed to delete user entity %d: %w", id, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected for user entity %d delete: %w", id, err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("%w: user entity %d", ErrEntityNotFound, id)
 	}
 	return nil
 }
@@ -51,26 +59,83 @@ func GetUserEntity(db *sqlx.DB, id int) (*UserEntity, error) {
 	return handleGetResultWithContext(result, err, "failed to get user entity %d: %w", id)
 }
 
-func UpdateUserEntity(db *sqlx.DB, entity *UserEntity) error {
-	stmt := `UPDATE user_entities SET name=?, latest_release_time=?, media_count=? WHERE id=?`
-	result, err := db.Exec(stmt, entity.Name, entity.LatestReleaseTime, entity.MediaCount, entity.Id)
-	if err != nil {
-		return fmt.Errorf("failed to update user entity %d: %w", entity.Id.Int32, err)
+// GetUserEntitiesByIDs 批量取 user_entities，返回以 id 为键的映射，
+// 供只带一组实体 ID 的调用方（如失败明细）避免逐条查询。
+func GetUserEntitiesByIDs(db *sqlx.DB, ids []int) (map[int]*UserEntity, error) {
+	result := make(map[int]*UserEntity, len(ids))
+	if len(ids) == 0 {
+		return result, nil
 	}
-	_, err = result.RowsAffected()
+
+	query, args, err := sqlx.In(`SELECT * FROM user_entities WHERE id IN (?)`, ids)
 	if err != nil {
-		return fmt.Errorf("failed to get rows affected: %w", err)
+		return nil, fmt.Errorf("failed to build batch user entity query: %w", err)
 	}
-	return nil
+	rows, err := db.Queryx(db.Rebind(query), args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to batch get user entities: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		record := &UserEntity{}
+		if err := rows.StructScan(record); err != nil {
+			return nil, fmt.Errorf("failed to scan user entity: %w", err)
+		}
+		if record.Id.Valid {
+			result[int(record.Id.Int32)] = record
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read user entities: %w", err)
+	}
+	return result, nil
 }
 
-// UpdateUserEntityFields 仅更新 name 和 media_count，不碰 latest_release_time，
-// 避免 PATCH 语义下因读取-写入窗口覆盖其他进程对该字段的修改（丢失更新）。
-func UpdateUserEntityFields(db *sqlx.DB, id int, name string, mediaCount sql.NullInt32) error {
-	stmt := `UPDATE user_entities SET name=?, media_count=? WHERE id=?`
-	_, err := db.Exec(stmt, name, mediaCount, id)
+// UpdateUserEntityNameIfCurrent updates only the directory-backed name when
+// the caller's view is still current. A false result reports a stale write.
+func UpdateUserEntityNameIfCurrent(db *sqlx.DB, id int, currentName, newName string) (bool, error) {
+	result, err := db.Exec(`UPDATE user_entities SET name=? WHERE id=? AND name=?`, newName, id, currentName)
 	if err != nil {
-		return fmt.Errorf("failed to update user entity %d fields: %w", id, err)
+		return false, fmt.Errorf("failed to rename user entity %d: %w", id, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to get rows affected for user entity %d rename: %w", id, err)
+	}
+	return rows == 1, nil
+}
+
+// UpdateUserEntityMetadata atomically updates only the optional statistics
+// supplied by the caller. A nil pointer leaves that column unchanged.
+// Timestamps are normalized to UTC so the stored TEXT order matches the
+// instant order (see NormalizeLegacyTimestamps).
+func UpdateUserEntityMetadata(db *sqlx.DB, id int, mediaCount *int32, latestReleaseTime *sql.NullTime) error {
+	setClauses := make([]string, 0, 2)
+	args := make([]interface{}, 0, 3)
+	if mediaCount != nil {
+		setClauses = append(setClauses, "media_count=?")
+		args = append(args, *mediaCount)
+	}
+	if latestReleaseTime != nil {
+		normalized := NormalizeNullTime(*latestReleaseTime)
+		setClauses = append(setClauses, "latest_release_time=?")
+		args = append(args, normalized)
+	}
+	if len(setClauses) == 0 {
+		return nil
+	}
+	args = append(args, id)
+	result, err := db.Exec(`UPDATE user_entities SET `+strings.Join(setClauses, ", ")+` WHERE id=?`, args...)
+	if err != nil {
+		return fmt.Errorf("failed to update user entity %d metadata: %w", id, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected for user entity %d metadata update: %w", id, err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("%w: user entity %d", ErrEntityNotFound, id)
 	}
 	return nil
 }
@@ -89,6 +154,9 @@ func UpdateUserEntityMediCount(db *sqlx.DB, eid int, count int) error {
 }
 
 func UpdateUserEntityTweetStat(db *sqlx.DB, eid int, baseline time.Time, count int) error {
+	// Normalize to UTC so the stored TEXT comparison in the CASE WHEN clauses
+	// follows instant order even when older rows carry a zone offset.
+	baseline = NormalizeTime(baseline)
 	stmt := `UPDATE user_entities
 SET latest_release_time=CASE
 		WHEN latest_release_time IS NULL OR latest_release_time < ? THEN ?
@@ -111,6 +179,8 @@ WHERE id=?`
 }
 
 func SetUserEntityLatestReleaseTime(db *sqlx.DB, id int, t time.Time) error {
+	// Store in UTC so the TEXT order matches the instant order.
+	t = NormalizeTime(t)
 	stmt := `UPDATE user_entities SET latest_release_time=? WHERE id=?`
 	result, err := db.Exec(stmt, t, id)
 	if err != nil {

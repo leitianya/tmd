@@ -56,9 +56,14 @@ func NewDownloadQueue(server *Server) *DownloadQueue {
 	return q
 }
 
-func (q *DownloadQueue) Enqueue(task *Task, run func(ctx context.Context, taskID string, reporter service.ProgressReporter) error) {
+// ErrQueueClosed 表示下载队列已关闭，拒绝新任务入队（关停 TOCTOU 防护：
+// 调用方必须把被拒绝的任务转为终态，而不是让 HTTP/Bot/Scheduler 收到
+// "已排队"但永不执行的假成功）。
+var ErrQueueClosed = errors.New("download queue is closed")
+
+func (q *DownloadQueue) Enqueue(task *Task, run func(ctx context.Context, taskID string, reporter service.ProgressReporter) error) error {
 	if task == nil || run == nil {
-		return
+		return errors.New("download queue: nil task or run function")
 	}
 
 	job := &downloadJob{
@@ -71,11 +76,14 @@ func (q *DownloadQueue) Enqueue(task *Task, run func(ctx context.Context, taskID
 	q.mu.Lock()
 	if q.closed {
 		q.mu.Unlock()
-		return
+		return fmt.Errorf("%w: task %s rejected during shutdown", ErrQueueClosed, task.ID)
 	}
 	q.pending = append(q.pending, job)
+	depth := len(q.pending)
 	q.mu.Unlock()
+	logQueueEnqueued(task, depth)
 	q.cond.Signal()
+	return nil
 }
 
 // Wakeup 唤醒可能正在 cond.Wait 上休眠的 worker，用于任务取消后让 worker 检查清理。
@@ -99,10 +107,13 @@ func (q *DownloadQueue) CloseAndWait(timeout time.Duration) {
 		return
 	}
 
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case <-q.workerDone:
-	case <-time.After(timeout):
-		log.Warnf("[download-queue] Worker exit timed out after %s", timeout)
+	case <-timer.C:
+		log.Warnf("[download-queue] Worker exit timeout timeout=%s", timeout)
+		return
 	}
 
 	detachedDone := make(chan struct{})
@@ -112,8 +123,8 @@ func (q *DownloadQueue) CloseAndWait(timeout time.Duration) {
 	}()
 	select {
 	case <-detachedDone:
-	case <-time.After(timeout):
-		log.Warnf("[download-queue] Detached runs still active after %s", timeout)
+	case <-timer.C:
+		log.Warnf("[download-queue] Detached runs active timeout=%s", timeout)
 	}
 }
 
@@ -202,7 +213,7 @@ func (q *DownloadQueue) executeJob(job *downloadJob) {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Errorf("[download-queue] Task %s panicked: %v", job.taskID, r)
+				log.Errorf("[download-queue] Task panic task_id=%s error=%q", job.taskID, fmt.Sprint(r))
 				done <- fmt.Errorf("download task panic: %v", r)
 			}
 		}()
@@ -237,6 +248,7 @@ func (q *DownloadQueue) detachJob(job *downloadJob, done <-chan error) {
 		keys:      append([]targetKey(nil), job.keys...),
 	}
 	q.mu.Unlock()
+	logQueueDetached(job.taskID, q.cancelGrace)
 
 	q.detachedWG.Add(1)
 	go func() {

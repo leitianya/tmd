@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
+	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -16,6 +19,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/unkmonster/tmd/internal/downloader"
+	"github.com/unkmonster/tmd/internal/logging"
 	"github.com/unkmonster/tmd/internal/naming"
 	"github.com/unkmonster/tmd/internal/twitter"
 	"github.com/unkmonster/tmd/internal/utils"
@@ -26,15 +30,15 @@ func writeAuxiliaryTweetFile(fileWriter downloader.FileWriter, writeReq download
 	// the media download result.
 	result, err := fileWriter.Write(writeReq)
 	if err != nil {
-		log.Warnf("[download] Failed to write %s: %v", fileType, err)
+		log.Warnf("[download] Auxiliary file write failed type=%s path=%q error=%q", fileType, logging.Path(writeReq.Path), logging.RedactSensitiveText(err.Error()))
 		return
 	}
 	if !result.Success {
-		log.Warnf("[download] %s write reported unsuccessful result: %s", fileType, writeReq.Path)
+		log.Warnf("[download] Auxiliary file write unsuccessful type=%s path=%q", fileType, logging.Path(writeReq.Path))
 		return
 	}
 	if result.Versioned {
-		log.Debugf("[download] %s write created version backup: %s", fileType, writeReq.Path)
+		log.Debugf("[download] Auxiliary file versioned type=%s path=%q", fileType, logging.Path(writeReq.Path))
 	}
 }
 
@@ -100,15 +104,12 @@ func saveLoongTweet(cfg *workerConfig, dir string, tweet *twitter.Tweet, namingO
 		if tweet.RawJSON != "" {
 			result := gjson.Parse(tweet.RawJSON)
 			tweetID = result.Get("rest_id").Uint()
-			if createdAtStr := result.Get("legacy.created_at").String(); createdAtStr != "" {
-				createdAt, _ = time.Parse(time.RubyDate, createdAtStr)
+			// 元数据文件采用容忍式解析：created_at 缺失/畸形时保留零值继续写 txt，
+			// 与 parseTweetResults 的硬失败语义有意不同（txt 不因时间戳丢失而丢弃）。
+			if t, err := twitter.TweetCreatedAtFromResult(&result); err == nil {
+				createdAt = t
 			}
-			noteText := result.Get("note_tweet.note_tweet_results.result.text").String()
-			if noteText != "" {
-				text = html.UnescapeString(noteText)
-			} else {
-				text = html.UnescapeString(result.Get("legacy.full_text").String())
-			}
+			text = twitter.TweetTextFromResult(&result)
 			screenName = result.Get("core.user_results.result.legacy.screen_name").String()
 			if screenName == "" {
 				screenName = "unknown"
@@ -210,7 +211,7 @@ func cleanMediaRecursive(data any) {
 
 						if mediaType, ok := m["type"].(string); ok && mediaType == "photo" {
 							if rawUrl, ok := m["media_url_https"].(string); ok {
-								m["media_url_https"] = utils.EnsurePhotoHighQuality(rawUrl)
+								m["media_url_https"] = upgradePhotoMediaURL(mediaType, rawUrl)
 							}
 						}
 					}
@@ -240,8 +241,35 @@ func (e *mediaDownloadError) Unwrap() error {
 	return e.cause
 }
 
-func isNonRetriableMediaError(err error) bool {
-	return utils.IsStatusCode(err, 403) || utils.IsStatusCode(err, 404)
+// upgradePhotoMediaURL 将 photo 类型媒体的 URL 升级为最高质量版本；
+// 非 photo 类型原样返回。供 cleanMediaRecursive（map 遍历）与
+// tweet_json_converter.upgradeMediaToHighQuality（类型化切片遍历）共用，
+// 避免高清升级逻辑双实现。
+func upgradePhotoMediaURL(mediaType, rawURL string) string {
+	if mediaType != "photo" {
+		return rawURL
+	}
+	return utils.EnsurePhotoHighQuality(rawURL)
+}
+
+func tweetMediaSummaryFields(succeeded, failed, skipped, total int) string {
+	if failed == 0 && skipped == 0 {
+		return ""
+	}
+
+	successField := fmt.Sprintf("succeeded=%d", succeeded)
+	failedField := fmt.Sprintf("failed=%d", failed)
+	skippedField := fmt.Sprintf("skipped=%d", skipped)
+
+	successField = color.FgGreen.Render(successField)
+	if failed > 0 {
+		failedField = color.FgRed.Render(failedField)
+	}
+	if skipped > 0 {
+		skippedField = color.FgYellow.Render(skippedField)
+	}
+
+	return fmt.Sprintf("%s %s %s total=%d", successField, failedField, skippedField, total)
 }
 
 func downloadTweetMedia(cfg *workerConfig, dir string, tweet *twitter.Tweet, skipLoongTweet bool) error {
@@ -251,32 +279,62 @@ func downloadTweetMedia(cfg *workerConfig, dir string, tweet *twitter.Tweet, ski
 	} else {
 		creatorTitle = "unknown"
 	}
-		tweetNaming := naming.NewTweetNaming(tweet.Text, tweet.Id, creatorTitle, cfg.maxFileNameLen)
+	tweetNaming := naming.NewTweetNaming(tweet.Text, tweet.Id, creatorTitle, cfg.maxFileNameLen)
 
 	if !skipLoongTweet {
 		saveTweetJson(cfg, dir, tweet, tweetNaming)
 		saveLoongTweet(cfg, dir, tweet, tweetNaming)
 	}
 
-	// tweet.Urls 最终只保留需要进入重试链路的 URL。
-	urls := tweet.Urls
+	// tweet.Urls 最终只保留需要进入重试链路的 URL。LegacyURLs keeps
+	// the same positional contract when a retry must still find a pre-upgrade
+	// filename after the process restarts.
+	urls := append([]string(nil), tweet.Urls...)
+	legacyURLs := append([]string(nil), tweet.LegacyURLs...)
+	retainLegacyURLs := len(urls) > 0 && len(legacyURLs) == len(urls)
+	legacyMediaIndex := cfg.legacyMediaIndexForBatch()
 	tweet.Urls = tweet.Urls[:0]
+	tweet.LegacyURLs = tweet.LegacyURLs[:0]
 	skippedUrls := make([]string, 0)
 	successUrls := make([]string, 0)
+	usedLegacyPaths := make(map[string]struct{})
 	var firstRetryableErr error
 
-	for _, u := range urls {
+	for index, u := range urls {
 		ext, err := utils.GetExtFromUrl(u)
 		if err != nil || ext == "" {
 			ext = ".jpg"
+		}
+		legacyURL := u
+		if retainLegacyURLs && legacyURLs[index] != "" {
+			legacyURL = legacyURLs[index]
+		}
+		legacyExt, legacyExtErr := utils.GetExtFromUrl(legacyURL)
+		if legacyExtErr != nil || legacyExt == "" {
+			legacyExt = ".jpg"
+		}
+
+		allowCurrentFileName := legacyURL != u
+		if legacyPath, found, lookupErr := existingLegacyMediaPath(legacyMediaIndex, dir, tweetNaming.FileName(ext), tweetNaming.LegacyFileNames(legacyExt), allowCurrentFileName, usedLegacyPaths); lookupErr != nil {
+			log.Warnf("[download] Media compatibility lookup failed tweet_id=%d url=%s error=%q", tweet.Id, logging.SanitizeURL(u), logging.RedactSensitiveText(lookupErr.Error()))
+			appendRetryableTweetURL(tweet, u, legacyURL, retainLegacyURLs)
+			if firstRetryableErr == nil {
+				firstRetryableErr = lookupErr
+			}
+			continue
+		} else if found {
+			usedLegacyPaths[legacyMediaPathKey(legacyPath)] = struct{}{}
+			log.Debugf("[download] Reused compatible media tweet_id=%d", tweet.Id)
+			successUrls = append(successUrls, u)
+			continue
 		}
 
 		downloadURL := utils.EnsurePhotoHighQuality(u)
 
 		path, err := tweetNaming.FilePathWithResolver(dir, ext, cfg.pathResolver)
 		if err != nil {
-			log.Warnf("[download] Failed to build media path (tweet %d): %s - %v", tweet.Id, u, err)
-			tweet.Urls = append(tweet.Urls, u)
+			log.Warnf("[download] Media path build failed tweet_id=%d url=%s error=%q", tweet.Id, logging.SanitizeURL(u), logging.RedactSensitiveText(err.Error()))
+			appendRetryableTweetURL(tweet, u, legacyURL, retainLegacyURLs)
 			if firstRetryableErr == nil {
 				firstRetryableErr = err
 			}
@@ -290,17 +348,20 @@ func downloadTweetMedia(cfg *workerConfig, dir string, tweet *twitter.Tweet, ski
 			Options: downloader.DownloadOptions{
 				SetModTime: &tweet.CreatedAt,
 			},
+			LogFields: map[string]interface{}{
+				"tweet_id": tweet.Id,
+			},
 		}
 
 		result, err := cfg.downloader.Download(req)
 		if err != nil {
-			if isNonRetriableMediaError(err) {
-				log.Infof("[download] Skip non-retriable media: %s - %v", u, err)
+			if downloader.IsNonRetriableStatusError(err) {
+				log.Infof("[download] Skip non-retriable media tweet_id=%d url=%s error=%q", tweet.Id, logging.SanitizeURL(u), logging.RedactSensitiveText(err.Error()))
 				skippedUrls = append(skippedUrls, u)
 				continue
 			}
-			log.Warnf("[download] Failed to download media (tweet %d): %s - %v", tweet.Id, u, err)
-			tweet.Urls = append(tweet.Urls, u)
+			log.Warnf("[download] Failed media tweet_id=%d url=%s error=%q", tweet.Id, logging.SanitizeURL(u), logging.RedactSensitiveText(err.Error()))
+			appendRetryableTweetURL(tweet, u, legacyURL, retainLegacyURLs)
 			if firstRetryableErr == nil {
 				firstRetryableErr = err
 			}
@@ -308,21 +369,25 @@ func downloadTweetMedia(cfg *workerConfig, dir string, tweet *twitter.Tweet, ski
 		}
 		if result == nil {
 			err = fmt.Errorf("download returned nil result")
-			log.Warnf("[download] Media download returned nil result (tweet %d): %s", tweet.Id, u)
-			tweet.Urls = append(tweet.Urls, u)
+			log.Warnf("[download] Media returned nil result tweet_id=%d url=%s", tweet.Id, logging.SanitizeURL(u))
+			appendRetryableTweetURL(tweet, u, legacyURL, retainLegacyURLs)
 			if firstRetryableErr == nil {
 				firstRetryableErr = err
 			}
 			continue
 		}
 		if !result.Success {
-			if result.Error != nil && isNonRetriableMediaError(result.Error) {
-				log.Infof("[download] Skip non-retriable media: %s - %v", u, result.Error)
+			if result.Error != nil && downloader.IsNonRetriableStatusError(result.Error) {
+				log.Infof("[download] Skip non-retriable media tweet_id=%d url=%s error=%q", tweet.Id, logging.SanitizeURL(u), logging.RedactSensitiveText(result.Error.Error()))
 				skippedUrls = append(skippedUrls, u)
 				continue
 			}
-			log.Warnf("[download] Media download reported failure (tweet %d): %s - %v", tweet.Id, u, result.Error)
-			tweet.Urls = append(tweet.Urls, u)
+			errorText := ""
+			if result.Error != nil {
+				errorText = logging.RedactSensitiveText(result.Error.Error())
+			}
+			log.Warnf("[download] Media reported failure tweet_id=%d url=%s error=%q", tweet.Id, logging.SanitizeURL(u), errorText)
+			appendRetryableTweetURL(tweet, u, legacyURL, retainLegacyURLs)
 			if firstRetryableErr == nil {
 				if result.Error != nil {
 					firstRetryableErr = result.Error
@@ -335,18 +400,16 @@ func downloadTweetMedia(cfg *workerConfig, dir string, tweet *twitter.Tweet, ski
 		successUrls = append(successUrls, u)
 	}
 
-	// 只在至少一个媒体下载成功时才打印推文标题
+	// Log one compact per-tweet completion line only when at least one media item succeeded.
 	if len(successUrls) > 0 {
-		fmt.Printf("%s", color.FgLightMagenta.Render(tweetNaming.LogFormat()))
 		totalAttempted := len(successUrls) + len(tweet.Urls) + len(skippedUrls)
-		if totalAttempted > len(successUrls) {
-			fmt.Printf(" [%d/%d succeeded", len(successUrls), totalAttempted)
-			if len(skippedUrls) > 0 {
-				fmt.Printf(", %d skipped", len(skippedUrls))
-			}
-			fmt.Printf("]")
+		titleField := color.FgLightMagenta.Render(tweetNaming.LogFormat())
+		summaryFields := tweetMediaSummaryFields(len(successUrls), len(tweet.Urls), len(skippedUrls), totalAttempted)
+		if summaryFields == "" {
+			log.Infof("[download] %s", titleField)
+		} else {
+			log.Infof("[download] %s %s", titleField, summaryFields)
 		}
-		fmt.Println()
 	}
 
 	// 只有可重试的失败才进入后续失败链路。
@@ -359,6 +422,196 @@ func downloadTweetMedia(cfg *workerConfig, dir string, tweet *twitter.Tweet, ski
 	return nil
 }
 
+func appendRetryableTweetURL(tweet *twitter.Tweet, url, legacyURL string, retainLegacyURL bool) {
+	tweet.Urls = append(tweet.Urls, url)
+	if retainLegacyURL {
+		tweet.LegacyURLs = append(tweet.LegacyURLs, legacyURL)
+	}
+}
+
+func (cfg *workerConfig) legacyMediaIndexForBatch() *legacyMediaPathIndex {
+	cfg.legacyMediaIndexOnce.Do(func() {
+		if cfg.legacyMediaIndex == nil {
+			cfg.legacyMediaIndex = newLegacyMediaPathIndex()
+		}
+	})
+	return cfg.legacyMediaIndex
+}
+
+type legacyMediaPathIndex struct {
+	mu          sync.Mutex
+	directories map[string]*legacyMediaDirectory
+	readDir     func(string) ([]os.DirEntry, error)
+}
+
+type legacyMediaDirectory struct {
+	once           sync.Once
+	collisionNames map[string][]string
+	err            error
+}
+
+type legacyMediaCollision struct {
+	name  string
+	index int
+}
+
+func newLegacyMediaPathIndex() *legacyMediaPathIndex {
+	return &legacyMediaPathIndex{
+		directories: make(map[string]*legacyMediaDirectory),
+		readDir:     os.ReadDir,
+	}
+}
+
+func (index *legacyMediaPathIndex) directory(dir string) (*legacyMediaDirectory, func(string) ([]os.DirEntry, error)) {
+	index.mu.Lock()
+	defer index.mu.Unlock()
+	if index.directories == nil {
+		index.directories = make(map[string]*legacyMediaDirectory)
+	}
+	key := filepath.Clean(dir)
+	directory := index.directories[key]
+	if directory == nil {
+		directory = &legacyMediaDirectory{}
+		index.directories[key] = directory
+	}
+	reader := index.readDir
+	if reader == nil {
+		reader = os.ReadDir
+	}
+	return directory, reader
+}
+
+func (directory *legacyMediaDirectory) load(dir string, readDir func(string) ([]os.DirEntry, error)) {
+	directory.once.Do(func() {
+		entries, err := readDir(dir)
+		if os.IsNotExist(err) {
+			directory.collisionNames = make(map[string][]string)
+			return
+		}
+		if err != nil {
+			directory.err = fmt.Errorf("scan media directory %q: %w", dir, err)
+			return
+		}
+
+		collisions := make(map[string][]legacyMediaCollision)
+		for _, entry := range entries {
+			baseName, collisionIndex, ok := legacyMediaCollisionBase(entry.Name())
+			if !ok {
+				continue
+			}
+			collisions[baseName] = append(collisions[baseName], legacyMediaCollision{name: entry.Name(), index: collisionIndex})
+		}
+
+		directory.collisionNames = make(map[string][]string, len(collisions))
+		for baseName, candidates := range collisions {
+			sort.Slice(candidates, func(i, j int) bool {
+				if candidates[i].index != candidates[j].index {
+					return candidates[i].index < candidates[j].index
+				}
+				return candidates[i].name < candidates[j].name
+			})
+			names := make([]string, 0, len(candidates))
+			for _, candidate := range candidates {
+				names = append(names, candidate.name)
+			}
+			directory.collisionNames[baseName] = names
+		}
+	})
+}
+
+func legacyMediaCollisionBase(name string) (string, int, bool) {
+	ext := filepath.Ext(name)
+	if ext == name {
+		ext = ""
+	}
+	stem := strings.TrimSuffix(name, ext)
+	if !strings.HasSuffix(stem, ")") {
+		return "", 0, false
+	}
+	left := strings.LastIndex(stem, "(")
+	if left <= 0 {
+		return "", 0, false
+	}
+	index, err := strconv.Atoi(stem[left+1 : len(stem)-1])
+	if err != nil || index < 1 {
+		return "", 0, false
+	}
+	return stem[:left] + ext, index, true
+}
+
+// existingLegacyMediaPath looks only for names written by an earlier naming
+// policy. A differing legacy URL proves that the old variant may have used the
+// current filename too (for example two different .mp4 bitrates), so that
+// filename is reusable only for that migration case. Other current-policy
+// names retain their normal collision-suffix behavior.
+func existingLegacyMediaPath(index *legacyMediaPathIndex, dir, currentFileName string, legacyFileNames []string, allowCurrentFileName bool, used map[string]struct{}) (string, bool, error) {
+	if index == nil {
+		index = newLegacyMediaPathIndex()
+	}
+	for _, legacyFileName := range legacyFileNames {
+		if legacyFileName == currentFileName && !allowCurrentFileName {
+			continue
+		}
+		path, found, err := index.findExistingLegacyMediaPath(dir, legacyFileName, used)
+		if err != nil || found {
+			return path, found, err
+		}
+	}
+	return "", false, nil
+}
+
+func (index *legacyMediaPathIndex) findExistingLegacyMediaPath(dir, fileName string, used map[string]struct{}) (string, bool, error) {
+	path := filepath.Join(dir, fileName)
+	if regular, err := isRegularMediaFile(path); err != nil {
+		return "", false, err
+	} else if regular && !legacyMediaPathIsUsed(path, used) {
+		return path, true, nil
+	}
+
+	directory, reader := index.directory(dir)
+	directory.load(dir, reader)
+	if directory.err != nil {
+		return "", false, directory.err
+	}
+	for _, candidateName := range directory.collisionNames[fileName] {
+		candidate := filepath.Join(dir, candidateName)
+		if legacyMediaPathIsUsed(candidate, used) {
+			continue
+		}
+		regular, statErr := isRegularMediaFile(candidate)
+		if statErr != nil {
+			return "", false, statErr
+		}
+		if regular {
+			return candidate, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+func isRegularMediaFile(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect compatible media path %q: %w", path, err)
+	}
+	return info.Mode()&os.ModeSymlink == 0 && info.Mode().IsRegular(), nil
+}
+
+func legacyMediaPathIsUsed(path string, used map[string]struct{}) bool {
+	if used == nil {
+		return false
+	}
+	_, exists := used[legacyMediaPathKey(path)]
+	return exists
+}
+
+func legacyMediaPathKey(path string) string {
+	return filepath.Clean(path)
+}
+
 func tweetDownloader(config *workerConfig, errch chan<- PackagedTweet, twech <-chan PackagedTweet) {
 	var pt PackagedTweet
 	var ok bool
@@ -368,7 +621,7 @@ func tweetDownloader(config *workerConfig, errch chan<- PackagedTweet, twech <-c
 	defer func() {
 		if p := recover(); p != nil {
 			config.cancel(fmt.Errorf("%v", p))
-			log.Errorln("[download] Panic:", p)
+			log.Errorf("[download] Tweet worker panic error=%q", fmt.Sprint(p))
 
 			safeSend := func(pt PackagedTweet) {
 				// Recover path only: if the consumer already stopped after cancellation,
@@ -410,10 +663,9 @@ func tweetDownloader(config *workerConfig, errch chan<- PackagedTweet, twech <-c
 					if tie, ok := pt.(TweetInEntity); ok && tie.Entity != nil {
 						parentDir := tie.Entity.ParentDir()
 						if parentDir != "" {
-								userNaming := naming.NewUserNaming(tweet.Creator.Name, tweet.Creator.ScreenName, config.maxFileNameLen)
-								userDirName := userNaming.SanitizedTitle()
-								userDir := filepath.Join(parentDir, userDirName)
-								tweetNaming := naming.NewTweetNaming(tweet.Text, tweet.Id, tweet.Creator.Title(), config.maxFileNameLen)
+							userDirName := naming.UserDirTitle(tweet.Creator.Name, tweet.Creator.ScreenName, config.maxFileNameLen)
+							userDir := filepath.Join(parentDir, userDirName)
+							tweetNaming := naming.NewTweetNaming(tweet.Text, tweet.Id, tweet.Creator.Title(), config.maxFileNameLen)
 							saveTweetJson(config, userDir, tweet, tweetNaming)
 							saveLoongTweet(config, userDir, tweet, tweetNaming)
 						}
@@ -447,8 +699,9 @@ func BatchDownloadTweet(ctx context.Context, client *resty.Client, skipLoongTwee
 	if len(pts) == 0 {
 		return nil
 	}
-	log.Infof("[download] Starting batch download for %d tweets", len(pts))
+	start := time.Now()
 	maxDownloadRoutine := opts.normalizedMaxDownloadRoutine()
+	log.Infof("[download] Tweet batch start tweets=%d media=%d workers=%d skip_metadata=%t", len(pts), countTotalUrls(pts), min(len(pts), maxDownloadRoutine), skipLoongTweet)
 
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -463,17 +716,17 @@ func BatchDownloadTweet(ctx context.Context, client *resty.Client, skipLoongTwee
 	}
 	close(tweetChan)
 
-		config := workerConfig{
-			ctx:            ctx,
-			cancel:         cancel,
-			wg:             &wg,
-			skipLoongTweet: skipLoongTweet,
-			downloader:     dwn,
-			fileWriter:     fileWriter,
-			onTweetDone:    onTweetDone,
-			pathResolver:   utils.NewUniquePathResolver(),
-			maxFileNameLen: opts.normalizedMaxFileNameLen(),
-		}
+	config := workerConfig{
+		ctx:            ctx,
+		cancel:         cancel,
+		wg:             &wg,
+		skipLoongTweet: skipLoongTweet,
+		downloader:     dwn,
+		fileWriter:     fileWriter,
+		onTweetDone:    onTweetDone,
+		pathResolver:   utils.NewUniquePathResolver(),
+		maxFileNameLen: opts.normalizedMaxFileNameLen(),
+	}
 	for i := 0; i < numRoutine; i++ {
 		wg.Add(1)
 		go tweetDownloader(&config, errChan, tweetChan)
@@ -488,6 +741,6 @@ func BatchDownloadTweet(ctx context.Context, client *resty.Client, skipLoongTwee
 	for pt := range errChan {
 		failedTweets = append(failedTweets, pt)
 	}
-	log.Infof("[download] Batch download complete: %d tweet(s) failed out of %d", len(failedTweets), len(pts))
+	log.Infof("[download] Tweet batch complete tweets=%d failed_tweets=%d dur=%s", len(pts), len(failedTweets), time.Since(start))
 	return failedTweets
 }

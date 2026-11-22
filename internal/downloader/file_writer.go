@@ -13,6 +13,7 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	"github.com/unkmonster/tmd/internal/logging"
 )
 
 var tweetIDRe = regexp.MustCompile(`_(\d+(?:\(\d+\))?)\.\w+$`)
@@ -61,7 +62,7 @@ func (fw *DefaultFileWriter) Write(req WriteRequest) (WriteResult, error) {
 			if fileInfo.Size() == result.NewSize {
 				oldHash, hashErr := fw.computeFileHash(req.Path)
 				if hashErr != nil {
-				log.Warnf("[downloader] Failed to compute file hash for SkipUnchanged check: %v, path: %s", hashErr, req.Path)
+					log.Warnf("[downloader] Hash check failed path=%q error=%q", logging.Path(req.Path), hashErr.Error())
 					return result, hashErr
 				}
 				newHash := fw.computeDataHash(req.Data)
@@ -75,15 +76,9 @@ func (fw *DefaultFileWriter) Write(req WriteRequest) (WriteResult, error) {
 	}
 
 	// 2. 创建版本备份（如果需要）
-		if req.Options.CreateVersion && fw.versionManager != nil {
-			if _, err := os.Stat(req.Path); err == nil {
-				_, err = fw.versionManager.CreateVersion(req.Path)
-				if err != nil {
-					return result, err
-				}
-				result.Versioned = true
-			}
-		}
+	if err := fw.createVersionBackup(req.Path, req.Options.CreateVersion, &result); err != nil {
+		return result, err
+	}
 
 	// 3. 原子写入
 	written, err := fw.atomicWriteFromReader(req.Path, bytes.NewReader(req.Data))
@@ -93,11 +88,7 @@ func (fw *DefaultFileWriter) Write(req WriteRequest) (WriteResult, error) {
 	result.NewSize = written
 
 	// 4. 设置修改时间
-	if req.Options.ModTime != nil {
-		if err := os.Chtimes(req.Path, time.Time{}, *req.Options.ModTime); err != nil {
-			log.Warnf("[downloader] Failed to set modification time for %s: %v", req.Path, err)
-		}
-	}
+	setModTime(req.Path, req.Options.ModTime)
 
 	result.Success = true
 	return result, nil
@@ -127,15 +118,9 @@ func (fw *DefaultFileWriter) writeStream(path string, reader io.Reader, size int
 	}
 
 	// 创建版本备份（如果需要）
-		if options.CreateVersion && fw.versionManager != nil {
-			if _, err := os.Stat(path); err == nil {
-				_, err = fw.versionManager.CreateVersion(path)
-				if err != nil {
-					return result, err
-				}
-				result.Versioned = true
-			}
-		}
+	if err := fw.createVersionBackup(path, options.CreateVersion, &result); err != nil {
+		return result, err
+	}
 
 	// 原子流式写入
 	written, err := fw.atomicWriteFromReader(path, reader)
@@ -147,14 +132,36 @@ func (fw *DefaultFileWriter) writeStream(path string, reader io.Reader, size int
 	result.NewSize = written
 
 	// 设置修改时间
-	if options.ModTime != nil {
-		if err := os.Chtimes(path, time.Time{}, *options.ModTime); err != nil {
-			log.Warnf("[downloader] Failed to set modification time for %s: %v", path, err)
-		}
-	}
+	setModTime(path, options.ModTime)
 
 	result.Success = true
 	return result, nil
+}
+
+// createVersionBackup 在目标文件已存在时把旧文件归档到版本目录。
+// 目标文件不存在时跳过；备份失败返回错误；成功时置位 result.Versioned。
+func (fw *DefaultFileWriter) createVersionBackup(path string, createVersion bool, result *WriteResult) error {
+	if !createVersion || fw.versionManager == nil {
+		return nil
+	}
+	if _, err := os.Stat(path); err != nil {
+		return nil
+	}
+	if _, err := fw.versionManager.CreateVersion(path); err != nil {
+		return err
+	}
+	result.Versioned = true
+	return nil
+}
+
+// setModTime 设置文件的修改时间；失败仅记录警告，不中断写入流程。
+func setModTime(path string, modTime *time.Time) {
+	if modTime == nil {
+		return
+	}
+	if err := os.Chtimes(path, time.Time{}, *modTime); err != nil {
+		log.Warnf("[downloader] Mod time set failed path=%q error=%q", logging.Path(path), err.Error())
+	}
 }
 
 // atomicWriteFromReader 原子写入 reader 内容
@@ -186,7 +193,7 @@ func (fw *DefaultFileWriter) atomicWriteFromReader(path string, reader io.Reader
 		return 0, fmt.Errorf("failed to close temp file: %w", err)
 	}
 
-	log.Debugf("[downloader] Atomic write: written %d bytes to %s", written, path)
+	log.Debugf("[downloader] Atomic write complete path=%q bytes=%d", logging.Path(path), written)
 
 	if err := os.Rename(tempPath, path); err != nil {
 		return 0, fmt.Errorf("failed to rename temp file: %w", err)
@@ -207,13 +214,18 @@ func (fw *DefaultFileWriter) fileExists(path string) (bool, os.FileInfo, error) 
 	return true, info, nil
 }
 
-// computeFileHash 计算文件 Hash
+// computeFileHash 以流式方式计算文件 Hash，避免把大文件整块读入内存。
 func (fw *DefaultFileWriter) computeFileHash(path string) (string, error) {
-	data, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
-	return fw.computeDataHash(data), nil
+	defer file.Close()
+	hash := md5.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 // computeDataHash 计算数据 Hash

@@ -1,127 +1,43 @@
-# Before starting work
+# TMD Agent Rules
 
-- Run `lat search` to find sections relevant to your task. Read them to understand the design intent before writing code.
-- Run `lat expand` on user prompts to expand any `[[refs]]` — this resolves section names to file locations and provides context.
+TMD 是 Twitter/X 媒体下载器：CLI、API Server 与内嵌 Web 控制台共用一个 Go 模块（Go 1.26，`github.com/unkmonster/tmd`）。
 
-# Post-task checklist (REQUIRED — do not skip)
+## 目标
 
-After EVERY task, before responding to the user:
+下载、补档、标记已下载与库内数据管理在 CLI 与 Web 两端行为一致。Web 是唯一前端，位于 `internal/api/web/download/`，零构建。
 
-- [ ] Update `lat.md/` if you added or changed any functionality, architecture, tests, or behavior
-- [ ] Run `lat check` — all wiki links and code refs must pass
-- [ ] Do not skip these steps. Do not consider your task done until both are complete.
+## 输入 / 输出
 
----
+- 输入：用户需求、仓库现状、`TMD_HOME` 下的 `conf.yaml`、`schedules.yaml`、`.data/foo.db`、`logs/`。
+- 输出：可构建的 Go 改动与对应测试；前端为 `index.html`、`app.js`、`overview.js`、`data.js`、`schedules.js`、`logs.js`、`config.js`、`styles.css` 八个文件。
 
-# What is lat.md?
+## 硬性边界
 
-This project uses [lat.md](https://www.npmjs.com/package/lat.md) to maintain a structured knowledge graph of its architecture, design decisions, and test specs in the `lat.md/` directory. It is a set of cross-linked markdown files that describe **what** this project does and **why** — the domain concepts, key design decisions, business logic, and test specifications. Use it to ground your work in the actual architecture rather than guessing.
+- 前端零构建：纯 HTML/CSS/JS，不引入框架、打包器或前端依赖。
+- 用户可见文案中英双语；颜色只走 CSS 变量；明暗主题必须同时可用。
+- 不改存储格式：`foo.db` schema、下载目录结构、`conf.yaml` 字段。
+- 不做破坏性操作（`git reset --hard`、删用户数据、强推），除非用户明确要求。
+- 未要求不提交；提交前通过门禁。
+- 复用现有 API 与组件，不新增重复接口。
+- 文档与注释只写当前事实（见 Writing Style）。
 
-# Commands
+## 验收
 
-```bash
-lat init                     # initialize lat.md/ in a new project
-lat locate "Section Name"    # find a section by name (exact, fuzzy)
-lat refs "file#Section"      # find what references a section
-lat search "natural language" # semantic search across all sections
-lat expand "user prompt text" # expand [[refs]] to resolved locations
-lat mcp                      # start MCP server (stdio) for AI agent tool access
-lat check                    # validate all links and code refs
-```
+- `go build ./...`
+- `go vet ./...`
+- `go test ./...`
+- `node --check internal/api/web/download/*.js`
 
-Run `lat --help` for all options, `lat <command> --help` per command.
+## 自主执行
 
-### MCP (Model Context Protocol)
+默认自行判断、一次做完并给出证据；只在产品语义、破坏性操作或范围扩张时提问。回答简短：改了什么、证据、剩余风险，不复述探索过程。
 
-`lat mcp` starts an MCP server (stdio transport) with 6 tools: `lat_locate`, `lat_section`, `lat_search`, `lat_expand`, `lat_check`, `lat_refs`. Configure it in your agent's MCP settings to avoid manual CLI fallback. See [upstream docs](https://github.com/1st1/lat.md#readme).
+## Writing Style
 
-### Semantic search key
-
-If `lat search` fails because no API key is configured, explain to the user that semantic search requires a key provided via `LAT_LLM_KEY` (direct value), `LAT_LLM_KEY_FILE` (path to key file), or `LAT_LLM_KEY_HELPER` (command that prints the key). Supported key prefixes: `sk-...` (OpenAI) or `vck_...` (Vercel). If the user doesn't want to set it up, use `lat locate` for direct lookups instead.
-
----
-
-# Quickstart: Add a new section
-
-1. Create or edit a file in `lat.md/` (e.g. `lat.md/feature-x.md`)
-2. Add a `# Title` and a one-paragraph description (≤250 chars)
-3. Link to it from the index `lat.md/lat.md` with `- [[feature-x]] — description`
-4. Cross-link from related sections with `[[feature-x#SectionName]]`
-5. Run `lat check` — fix any broken links
-
-# CI Integration
-
-`lat check` should be part of CI to prevent drift. Current `.github/workflows/go.yml` only builds release binaries — add a `lat check` step if you enable CI for PRs.
-
-# Syntax primer
-
-- **Section ids**: `lat.md/path/to/file#Heading#SubHeading` — full form uses project-root-relative path (e.g. `lat.md/tests/search#RAG Replay Tests`). Short form uses bare file name when unique (e.g. `search#RAG Replay Tests`, `cli#search#Indexing`).
-- **Wiki links**: `[[target]]` or `[[target|alias]]` — cross-references between sections. Can also reference source code: `[[src/foo.ts#myFunction]]`.
-- **Source code links**: Wiki links in `lat.md/` files can reference functions, classes, constants, and methods in TypeScript/JavaScript/Python/Rust/Go/C files. Use the full path: `[[src/config.ts#getConfigDir]]`, `[[src/server.ts#App#listen]]` (class method), `[[lib/utils.py#parse_args]]`, `[[src/lib.rs#Greeter#greet]]` (Rust impl method), `[[src/app.go#Greeter#Greet]]` (Go method), `[[src/app.h#Greeter]]` (C struct). `lat check` validates these exist.
-- **Code refs**: `// @lat: [[section-id]]` (JS/TS/Rust/Go/C) or `# @lat: [[section-id]]` (Python) — ties source code to concepts
-
-# Test specs
-
-Key tests can be described as sections in `lat.md/` files (e.g. `tests.md`). Add frontmatter to require that every leaf section is referenced by a `// @lat:` or `# @lat:` comment in test code:
-
-```markdown
----
-lat:
-  require-code-mention: true
----
-# Tests
-
-Authentication and authorization test specifications.
-
-## User login
-
-Verify credential validation and error handling for the login endpoint.
-
-### Rejects expired tokens
-Tokens past their expiry timestamp are rejected with 401, even if otherwise valid.
-
-### Handles missing password
-Login request without a password field returns 400 with a descriptive error.
-```
-
-Every section MUST have a description — at least one sentence explaining what the test verifies and why. Empty sections with just a heading are not acceptable. (This is a specific case of the general leading paragraph rule below.)
-
-Each test in code should reference its spec with exactly one comment placed next to the relevant test — not at the top of the file:
-
-```python
-# @lat: [[tests#User login#Rejects expired tokens]]
-def test_rejects_expired_tokens():
-    ...
-
-# @lat: [[tests#User login#Handles missing password]]
-def test_handles_missing_password():
-    ...
-```
-
-Do not duplicate refs. One `@lat:` comment per spec section, placed at the test that covers it. `lat check` will flag any spec section not covered by a code reference, and any code reference pointing to a nonexistent section.
-
-# Section structure
-
-Every section in `lat.md/` **must** have a leading paragraph — at least one sentence immediately after the heading, before any child headings or other block content. The first paragraph must be ≤250 characters (excluding `[[wiki link]]` content). This paragraph serves as the section's overview and is used in search results, command output, and RAG context — keeping it concise guarantees the section's essence is always captured.
-
-```markdown
-# Good Section
-
-Brief overview of what this section documents and why it matters.
-
-More detail can go in subsequent paragraphs, code blocks, or lists.
-
-## Child heading
-
-Details about this child topic.
-```
-
-```markdown
-# Bad Section
-
-## Child heading
-
-Details about this child topic.
-```
-
-The second example is invalid because `Bad Section` has no leading paragraph. `lat check` validates this rule and reports errors for missing or overly long leading paragraphs.
+- Write documentation and code comments as current-state statements, not as a lab log.
+- State what is true now: current values, current behavior, current constraints. The reader wants the state, not the journey.
+- Drop process narration. No "之前是 A，后来改成 B", "扩容后复测", "第一次测出 X，修正为 Y", "起初失败，然后修复", "本轮验证了…". Once a fact is settled, record only the settled fact.
+- Keep a measured fact only when it still holds, and present it as a fact with its date if useful: "内存 15.6 GiB，无 swap（2026-10-17）". Never present a measurement as an experiment report.
+- History belongs in changelogs, commit messages, and chat replies — not in the document body or comments.
+- Code comments describe what the code does and why, in present tense. No debug trail, no "临时改成…稍后改回", no test-run results.
+- Same rule for reports, README, and skill files. If a section reads like a diary, rewrite it as a specification.

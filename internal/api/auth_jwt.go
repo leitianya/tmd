@@ -12,6 +12,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	log "github.com/sirupsen/logrus"
+	"github.com/unkmonster/tmd/internal/logging"
 )
 
 // JWT constants
@@ -20,8 +21,45 @@ const (
 	jwtSubject       = "tmd-session"
 	jwtTokenTTL      = 1 * time.Hour
 	jwtRefreshMargin = 5 * time.Minute // refresh when less than 5 min remaining
-	jwtSigningCtx    = "tmd-jwt-v1"    // HMAC derivation context
+	// jwtMaxRefreshAge 限制 refresh 链的存活窗口：过期 JWT 只有在签发后
+	// 该时长内可续期。防止被盗令牌无限期续期（唯一吊销手段是轮换 api_key）。
+	jwtMaxRefreshAge = 24 * time.Hour
+	jwtSigningCtx    = "tmd-jwt-v1" // HMAC derivation context
 )
+
+// enforceMaxRefreshAge rejects refresh tokens whose original issuance is older
+// than jwtMaxRefreshAge. The refresh window is measured from IssuedAt so a
+// continuously-refreshed session (each new token re-issues now) stays valid,
+// while an abandoned ancient token cannot be revived. It parses the token
+// again without the expiry check because validateSessionToken returns a nil
+// token (not just an error) once the token is expired.
+func enforceMaxRefreshAge(tokenString string, apiKey string) error {
+	secret := deriveJWTSecret(apiKey)
+	parsed, err := jwt.ParseWithClaims(tokenString, &jwtClaims{}, func(t *jwt.Token) (any, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
+		return secret, nil
+	},
+		jwt.WithIssuer(jwtIssuer),
+		jwt.WithSubject(jwtSubject),
+		jwt.WithValidMethods([]string{"HS256"}),
+		// 只解析并验证签名/issuer/subject，不校验过期——过期正是本函数
+		// 需要检查的状态（golang-jwt 默认在过期时返回 nil token）。
+		jwt.WithoutClaimsValidation(),
+	)
+	if err != nil {
+		return fmt.Errorf("parse token for age check: %w", err)
+	}
+	claims, ok := parsed.Claims.(*jwtClaims)
+	if !ok || claims == nil || claims.IssuedAt == nil {
+		return fmt.Errorf("token has no issued-at claim")
+	}
+	if time.Since(claims.IssuedAt.Time) > jwtMaxRefreshAge {
+		return fmt.Errorf("token issued more than %s ago", jwtMaxRefreshAge)
+	}
+	return nil
+}
 
 // deriveJWTSecret derives a 256-bit HMAC key from the API Key.
 // Using a derived key means: if jwt_secret leaks, the original api_key is unaffected.
@@ -104,7 +142,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	s.configMu.RUnlock()
 
 	if apiKey == "" {
-		log.Warnf("[auth] API key is not configured")
+		log.Warn("[auth] API key missing")
 		s.writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -112,7 +150,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	// Rate limit check (基于纯 IP，排除端口)
 	clientAddr := clientIP(r.RemoteAddr)
 	if !s.authRateLimit.Allow(clientAddr) {
-		log.Warnf("[auth] Rate limit exceeded for %s", clientAddr)
+		log.Warnf("[auth] Rate limit exceeded ip=%s operation=login", clientAddr)
 		s.writeError(w, http.StatusTooManyRequests, "too many requests")
 		return
 	}
@@ -120,26 +158,22 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	// Validate
 	if token != apiKey {
 		s.authRateLimit.Fail(clientAddr)
-		log.Warnf("[auth] Failed login attempt from %s", clientAddr)
-		if len(token) >= 4 {
-			log.Debugf("[auth] Failed login token prefix: %q", token[:4])
+		log.Warnf("[auth] Login rejected ip=%s reason=api_key_mismatch", clientAddr)
+		if token != "" {
+			log.Debugf("[auth] Rejected token fingerprint=%s", logging.MaskSecret(token))
 		}
 		s.writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 	jwtToken, err := generateSessionToken(apiKey)
 	if err != nil {
-		log.Errorf("[auth] Failed to generate token: %v", err)
+		log.Errorf("[auth] Token generate failed operation=login error=%q", err.Error())
 		s.writeError(w, http.StatusInternalServerError, "failed to generate token")
 		return
 	}
 
 	expiry := time.Now().Add(jwtTokenTTL)
-	s.writeJSON(w, http.StatusOK, NewSuccessResponse(map[string]interface{}{
-		"token":      jwtToken,
-		"expires_at": expiry.UTC().Format(time.RFC3339),
-		"expires_in": int(jwtTokenTTL.Seconds()),
-	}))
+	s.writeJSON(w, http.StatusOK, NewSuccessResponse(tokenResponsePayload(jwtToken, expiry, int(jwtTokenTTL.Seconds()))))
 }
 
 // handleAuthRefresh accepts a valid JWT and returns a new JWT with fresh expiry.
@@ -163,7 +197,7 @@ func (s *Server) handleAuthRefresh(w http.ResponseWriter, r *http.Request) {
 	s.configMu.RUnlock()
 
 	if apiKey == "" {
-		log.Warnf("[auth] API key is not configured")
+		log.Warn("[auth] API key missing")
 		s.writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -171,36 +205,41 @@ func (s *Server) handleAuthRefresh(w http.ResponseWriter, r *http.Request) {
 	// Rate limit check
 	clientAddr := clientIP(r.RemoteAddr)
 	if !s.authRateLimit.Allow(clientAddr) {
-		log.Warnf("[auth] Refresh rate limit exceeded for %s", clientAddr)
+		log.Warnf("[auth] Rate limit exceeded ip=%s operation=refresh", clientAddr)
 		s.writeError(w, http.StatusTooManyRequests, "too many requests")
 		return
 	}
 
 	// Validate the JWT — accept expired tokens too (the client is trying to refresh them)
-	_, err := validateSessionToken(tokenStr, apiKey)
-	if err != nil && !isJWTExpiredError(err) {
+	if _, err := validateSessionToken(tokenStr, apiKey); err != nil && !isJWTExpiredError(err) {
 		// Token is invalid (bad signature, wrong format, etc.)
 		w.Header().Set("X-Token-Type", "invalid")
-		log.Warnf("[auth] Refresh rejected from %s: %v", clientIP(r.RemoteAddr), err)
+		log.Warnf("[auth] Refresh rejected ip=%s error=%q", clientAddr, err.Error())
 		s.writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	// Expired JWT with valid signature is acceptable for refresh
+	// Expired JWT with valid signature is acceptable for refresh — but only
+	// within the maximum refresh window. A token issued arbitrarily long ago
+	// (e.g. stolen and refreshed forever) must not be renewable; the only
+	// existing revocation mechanism (rotating api_key) would otherwise be
+	// useless against a leaked session.
+	if err := enforceMaxRefreshAge(tokenStr, apiKey); err != nil {
+		w.Header().Set("X-Token-Type", "too-old")
+		log.Warnf("[auth] Refresh rejected ip=%s error=%q", clientAddr, err.Error())
+		s.writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
 
 	// Generate new JWT
 	jwtToken, err := generateSessionToken(apiKey)
 	if err != nil {
-		log.Errorf("[auth] Failed to generate refresh token: %v", err)
+		log.Errorf("[auth] Token generate failed operation=refresh error=%q", err.Error())
 		s.writeError(w, http.StatusInternalServerError, "failed to generate token")
 		return
 	}
 
 	expiry := time.Now().Add(jwtTokenTTL)
-	s.writeJSON(w, http.StatusOK, NewSuccessResponse(map[string]interface{}{
-		"token":      jwtToken,
-		"expires_at": expiry.UTC().Format(time.RFC3339),
-		"expires_in": int(jwtTokenTTL.Seconds()),
-	}))
+	s.writeJSON(w, http.StatusOK, NewSuccessResponse(tokenResponsePayload(jwtToken, expiry, int(jwtTokenTTL.Seconds()))))
 }
 
 // handleAuthCheck returns the current JWT status.
@@ -234,7 +273,7 @@ func (s *Server) handleAuthCheck(w http.ResponseWriter, r *http.Request) {
 	// Rate limit check
 	clientAddr := clientIP(r.RemoteAddr)
 	if !s.authRateLimit.Allow(clientAddr) {
-		log.Warnf("[auth] Check rate limit exceeded for %s", clientAddr)
+		log.Warnf("[auth] Rate limit exceeded ip=%s operation=check", clientAddr)
 		s.writeJSON(w, http.StatusOK, NewSuccessResponse(map[string]interface{}{
 			"authenticated": false,
 			"auth_enabled":  authEnabled,
@@ -259,7 +298,7 @@ func (s *Server) handleAuthCheck(w http.ResponseWriter, r *http.Request) {
 		if isExpired {
 			errMsg = "token expired"
 		}
-		log.Debugf("[auth] Check: %v", err)
+		log.Debugf("[auth] Check rejected ip=%s expired=%t error=%q", clientAddr, isExpired, err.Error())
 		s.writeJSON(w, http.StatusOK, NewSuccessResponse(map[string]interface{}{
 			"authenticated": false,
 			"auth_enabled":  true,
@@ -272,24 +311,40 @@ func (s *Server) handleAuthCheck(w http.ResponseWriter, r *http.Request) {
 
 	claims, ok := token.Claims.(*jwtClaims)
 	if !ok {
-		log.Errorf("[auth] Check: unexpected claims type %T", token.Claims)
+		log.Errorf("[auth] Check failed reason=unexpected_claims_type type=%T", token.Claims)
 		s.writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	exp := claims.ExpiresAt.Time
 	remaining := time.Until(exp)
 
-	s.writeJSON(w, http.StatusOK, NewSuccessResponse(map[string]interface{}{
-		"authenticated": true,
-		"auth_enabled":  true,
-		"valid":         true,
-		"expires_at":    exp.UTC().Format(time.RFC3339),
-		"expires_in":    int(remaining.Seconds()),
-		"needs_refresh": remaining < jwtRefreshMargin,
-	}))
+	// 复用登录/刷新共用的 expires_at/expires_in 构造；原校验响应不含 token 字段，
+	// 传空 token 以保持逐字一致，再追加校验状态字段
+	payload := tokenResponsePayload("", exp, int(remaining.Seconds()))
+	payload["authenticated"] = true
+	payload["auth_enabled"] = true
+	payload["valid"] = true
+	payload["needs_refresh"] = remaining < jwtRefreshMargin
+	s.writeJSON(w, http.StatusOK, NewSuccessResponse(payload))
 }
 
 // ---- Helpers ----
+
+// tokenResponsePayload 构造会话令牌响应的公共字段。
+// 登录/刷新端点返回 token/expires_at/expires_in 三字段；handleAuthCheck 只复用
+// expires_at/expires_in（原校验响应不含 token 字段，保持逐字一致，故传入空 token
+// 时省略该字段）。expiresIn 由调用方按原有语义计算传入（登录/刷新为 TTL 秒数、
+// 校验为剩余秒数），保证整型截断与改造前完全一致。
+func tokenResponsePayload(token string, expiry time.Time, expiresIn int) map[string]interface{} {
+	payload := map[string]interface{}{
+		"expires_at": expiry.UTC().Format(time.RFC3339),
+		"expires_in": expiresIn,
+	}
+	if token != "" {
+		payload["token"] = token
+	}
+	return payload
+}
 
 // clientIP 从 RemoteAddr（格式 "host:port"）中提取纯 IP 地址。
 // 如果解析失败，返回原始字符串作为 fallback。
@@ -322,9 +377,8 @@ type rateLimitEntry struct {
 
 const (
 	maxLoginAttempts = 5
-	loginWindow     = 1 * time.Minute
+	loginWindow      = 1 * time.Minute
 )
-
 
 func (rl *authRateLimiter) Allow(addr string) bool {
 	rl.mu.Lock()

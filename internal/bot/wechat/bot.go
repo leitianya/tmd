@@ -2,15 +2,17 @@ package wechat
 
 import (
 	"context"
+	"github.com/SpellingDragon/wechat-robot-go/wechat"
+	log "github.com/sirupsen/logrus"
 	"strings"
 	"sync"
 	"time"
-	log "github.com/sirupsen/logrus"
-	"github.com/SpellingDragon/wechat-robot-go/wechat"
 
 	"github.com/unkmonster/tmd/internal/api"
+	"github.com/unkmonster/tmd/internal/bot"
 	"github.com/unkmonster/tmd/internal/config"
 	"github.com/unkmonster/tmd/internal/consolelog"
+	"github.com/unkmonster/tmd/internal/logging"
 )
 
 // Bot 是微信 iLink bot 实现
@@ -19,43 +21,46 @@ type Bot struct {
 	taskManager *api.TaskManager
 	eventBus    *api.EventBus
 	logHub      *consolelog.Hub
+	enqueueTask func(*api.Task) error
 
 	wechatBot *wechat.Bot
 
 	userTokens map[string]string
-	userTasks  map[string]map[string]struct{}
+	tracker    *bot.TaskTracker
 	mu         sync.Mutex
-	stopCh chan struct{}
-	wg     sync.WaitGroup
-	cancel context.CancelFunc
+	stopCh     chan struct{}
+	wg         sync.WaitGroup
+	cancel     context.CancelFunc
+	stopOnce   sync.Once
 }
 
 // NewBot 创建微信 bot 实例
-func NewBot(cfg *config.WeChatBotConfig, tm *api.TaskManager, eb *api.EventBus, lh *consolelog.Hub) *Bot {
+func NewBot(cfg *config.WeChatBotConfig, tm *api.TaskManager, eb *api.EventBus, lh *consolelog.Hub, enqueueTask func(*api.Task) error) *Bot {
 	return &Bot{
 		config:      cfg,
 		taskManager: tm,
 		eventBus:    eb,
 		logHub:      lh,
+		enqueueTask: enqueueTask,
 		userTokens:  make(map[string]string),
-		userTasks:   make(map[string]map[string]struct{}),
+		tracker:     bot.NewTaskTracker(),
 		stopCh:      make(chan struct{}),
 	}
 }
 
 // Start 启动 bot。扫码登录后订阅消息和事件。
 func (b *Bot) Start() error {
-	bot := wechat.NewBot(
+	wb := wechat.NewBot(
 		wechat.WithTokenFile(b.config.CredentialPath),
 	)
-	b.wechatBot = bot
+	b.wechatBot = wb
 
 	ctx, cancel := context.WithCancel(context.Background())
 	b.cancel = cancel
 
-	bot.OnMessage(func(ctx context.Context, msg *wechat.Message) error {
+	wb.OnMessage(func(ctx context.Context, msg *wechat.Message) error {
 		if !b.isAllowed(msg.FromUserID) {
-			return bot.Reply(ctx, msg, "⛔ Unauthorized")
+			return wb.Reply(ctx, msg, bot.UnauthorizedText)
 		}
 		b.mu.Lock()
 		b.userTokens[msg.FromUserID] = msg.ContextToken
@@ -77,7 +82,7 @@ func (b *Bot) Start() error {
 		b.runWithReconnect(ctx)
 	}()
 
-	log.Infof("[bot-wechat] Starting (credential: %s)", b.config.CredentialPath)
+	log.Infof("[bot-wechat] Starting credential_path=%q", logging.Path(b.config.CredentialPath))
 	return nil
 }
 
@@ -91,11 +96,13 @@ func (b *Bot) runWithReconnect(ctx context.Context) {
 
 		loginCtx, loginCancel := context.WithTimeout(ctx, 2*time.Minute)
 		err := b.wechatBot.Login(loginCtx, func(qrCode string) {
-			log.Infof("[bot-wechat] QR code URL: %s", qrCode)
+			// 二维码是可直接渲染扫描的 base64 图像（登录凭据），绝不能进日志
+			// （终端/文件/Web 面板）。只记录接收到的数据大小，便于排查。
+			log.Infof("[bot-wechat] Login QR received bytes=%d hint=scan_to_login", len(qrCode))
 		})
 		loginCancel()
 		if err != nil {
-			log.Warnf("[bot-wechat] Login failed: %v, retrying in 30s...", err)
+			log.Warnf("[bot-wechat] Login failed retry_after=30s error=%q", err.Error())
 			select {
 			case <-b.stopCh:
 				return
@@ -103,7 +110,7 @@ func (b *Bot) runWithReconnect(ctx context.Context) {
 			}
 			continue
 		}
-		log.Infof("[bot-wechat] Logged in")
+		log.Info("[bot-wechat] Logged in")
 
 		b.wechatBot.Run(ctx)
 
@@ -111,18 +118,20 @@ func (b *Bot) runWithReconnect(ctx context.Context) {
 		case <-b.stopCh:
 			return
 		case <-time.After(5 * time.Second):
-			log.Warnf("[bot-wechat] Connection lost, reconnecting...")
+			log.Warn("[bot-wechat] Connection lost reconnecting=true")
 		}
 	}
 }
 
 // Stop 停止 bot
 func (b *Bot) Stop() {
-	if b.cancel != nil {
-		b.cancel()
-	}
-	close(b.stopCh)
-	b.wg.Wait()
+	b.stopOnce.Do(func() {
+		if b.cancel != nil {
+			b.cancel()
+		}
+		close(b.stopCh)
+		b.wg.Wait()
+	})
 }
 
 // Name 返回 bot 名称
@@ -145,12 +154,9 @@ func (b *Bot) handleMessage(ctx context.Context, msg *wechat.Message) {
 	if text == "" || !strings.HasPrefix(text, "/") {
 		return
 	}
-	parts := strings.SplitN(text, " ", 2)
-	cmd := strings.TrimPrefix(parts[0], "/")
-	args := ""
-	if len(parts) > 1 {
-		args = strings.TrimSpace(parts[1])
-	}
+	fields := strings.Fields(text)
+	cmd := strings.TrimPrefix(fields[0], "/")
+	args := strings.Join(fields[1:], " ")
 	switch cmd {
 	case "dl", "download":
 		b.cmdDownload(ctx, msg, args)
@@ -160,6 +166,8 @@ func (b *Bot) handleMessage(ctx context.Context, msg *wechat.Message) {
 		b.cmdCancel(ctx, msg, args)
 	case "tasks":
 		b.cmdTasks(ctx, msg)
+	case "stats":
+		b.cmdStats(ctx, msg)
 	case "start", "help":
 		b.cmdHelp(ctx, msg)
 	default:
@@ -169,6 +177,6 @@ func (b *Bot) handleMessage(ctx context.Context, msg *wechat.Message) {
 
 func (b *Bot) sendText(ctx context.Context, userID, text string) {
 	if err := b.wechatBot.SendTextToUser(ctx, userID, text); err != nil {
-		log.Warnf("[bot-wechat] Failed to send message to %s: %v", userID, err)
+		log.Warnf("[bot-wechat] Send message failed user_id=%s error=%q", userID, err.Error())
 	}
 }

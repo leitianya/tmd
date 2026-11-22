@@ -2,165 +2,373 @@ package entity
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/unkmonster/tmd/internal/database"
 )
 
-// UserEntity 用户实体
+// UserEntity represents a user's database record and storage directory.
 type UserEntity struct {
 	record  *database.UserEntity
 	db      *sqlx.DB
 	created bool
 }
 
-// NewUserEntity 创建或加载用户实体
+// NewUserEntity loads the entity for uid and parentDir, or returns an unrecorded entity ready to create.
 func NewUserEntity(db *sqlx.DB, uid uint64, parentDir string) (*UserEntity, error) {
-	created := true
-	record, err := database.LocateUserEntity(db, uid, parentDir)
+	if db == nil {
+		return nil, fmt.Errorf("create user entity: database is nil")
+	}
+	absParentDir, err := filepath.Abs(parentDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve user entity parent directory %q: %w", parentDir, err)
+	}
+	record, err := database.LocateUserEntity(db, uid, absParentDir)
 	if err != nil {
 		return nil, err
 	}
 	if record == nil {
-		record = &database.UserEntity{}
-		record.UserId = uid
-		record.ParentDir = parentDir
-		created = false
+		record = &database.UserEntity{UserId: uid, ParentDir: absParentDir}
+		return &UserEntity{record: record, db: db}, nil
 	}
-	return &UserEntity{record: record, db: db, created: created}, nil
+	return &UserEntity{record: record, db: db, created: true}, nil
 }
 
 func (ue *UserEntity) Create(name string) error {
-	ue.record.Name = name
-	path, _ := ue.Path()
-	if err := os.MkdirAll(path, 0755); err != nil {
+	if err := ue.requireRecord(); err != nil {
 		return err
 	}
-
-	if err := database.CreateUserEntity(ue.db, ue.record); err != nil {
+	if ue.db == nil {
+		return fmt.Errorf("create %s: database is nil", ue.description())
+	}
+	unlockEntity := lockEntityOperation("user", strconv.FormatUint(ue.record.UserId, 10), ue.record.ParentDir)
+	defer unlockEntity()
+	unlockParent := lockEntityStorageParent(ue.record.ParentDir)
+	defer unlockParent()
+	if ue.created {
+		return fmt.Errorf("%s already exists", ue.description())
+	}
+	current, err := database.LocateUserEntity(ue.db, ue.record.UserId, ue.record.ParentDir)
+	if err != nil {
+		return fmt.Errorf("check existing %s: %w", ue.description(), err)
+	}
+	if current != nil {
+		*ue.record = *current
+		ue.created = true
+		return fmt.Errorf("%s already exists", ue.description())
+	}
+	path, err := entityPath(ue.record.ParentDir, name)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", ue.description(), err)
+	}
+	change, err := ensureEntityDirectory(path)
+	if err != nil {
 		return err
+	}
+	// 无论目录是否本次新建都要检查归属：他人记录可能因归一化（遗留
+	// 尾点/尾空格）或大小写变体映射到同一路径，且其目录当前缺失——
+	// 此时新建目录会让两个实体记录共享同一目录（媒体混写）。
+	owned, ownerErr := entityDirectoryOwnedByAnother(ue.db, ue.record.ParentDir, path, "user", ue.record.UserId)
+	if ownerErr != nil {
+		// 归属检查查询失败（瞬时 SQLITE_BUSY/IO）：本次若新建了目录，
+		// 必须回滚移除，否则残留孤儿空目录且无自愈机制（启动清扫只
+		// 处理 .tmd-remove-* 前缀）。
+		return change.rollback(fmt.Errorf("create %s: %w", ue.description(), ownerErr))
+	}
+	if owned {
+		// 目录归属冲突：若本次新建了目录，回滚移除，避免残留空目录。
+		// 包 ErrPathConflict 使 API 层映射为 409（与目标已存在的冲突一致）。
+		return change.rollback(fmt.Errorf("%w: create %s: directory %q already belongs to another entity", ErrPathConflict, ue.description(), path))
+	}
+
+	oldName := ue.record.Name
+	oldID := ue.record.Id
+	ue.record.Name = name
+	if err := database.CreateUserEntity(ue.db, ue.record); err != nil {
+		ue.record.Name = oldName
+		ue.record.Id = oldID
+		return change.rollback(fmt.Errorf("create %s database record: %w", ue.description(), err))
 	}
 	ue.created = true
 	return nil
 }
 
 func (ue *UserEntity) Remove() error {
-	path, _ := ue.Path()
-
-	if err := os.RemoveAll(path); err != nil {
+	if err := ue.requireRecord(); err != nil {
+		return err
+	}
+	if ue.db == nil {
+		return fmt.Errorf("remove %s: database is nil", ue.description())
+	}
+	unlockEntity := lockEntityOperation("user", strconv.FormatUint(ue.record.UserId, 10), ue.record.ParentDir)
+	defer unlockEntity()
+	unlockParent := lockEntityStorageParent(ue.record.ParentDir)
+	defer unlockParent()
+	if err := ue.requireRecorded(); err != nil {
+		return err
+	}
+	if err := ue.refreshRecord(); err != nil {
+		return err
+	}
+	if ue.record.Name == "" {
+		if err := database.DelUserEntity(ue.db, uint32(ue.record.Id.Int32)); err != nil {
+			return fmt.Errorf("delete legacy empty-name %s database record: %w", ue.description(), TranslateError(err))
+		}
+		ue.created = false
+		ue.record.Id.Valid = false
+		ue.record.Id.Int32 = 0
+		return nil
+	}
+	path, err := ue.Path()
+	if err != nil {
+		return fmt.Errorf("remove %s: %w", ue.description(), err)
+	}
+	staged, err := stageEntityDirectoryRemoval(ue.db, path)
+	if err != nil {
 		return err
 	}
 	if err := database.DelUserEntity(ue.db, uint32(ue.record.Id.Int32)); err != nil {
+		return staged.rollback(ue.db, fmt.Errorf("delete %s database record: %w", ue.description(), TranslateError(err)))
+	}
+
+	ue.created = false
+	ue.record.Id.Valid = false
+	ue.record.Id.Int32 = 0
+	return staged.commit(ue.db)
+}
+
+func (ue *UserEntity) Rename(name string) error {
+	if err := ue.requireRecord(); err != nil {
 		return err
 	}
-	ue.created = false
+	if ue.db == nil {
+		return fmt.Errorf("rename %s: database is nil", ue.description())
+	}
+	if err := ValidateName(name); err != nil {
+		return err
+	}
+	unlockEntity := lockEntityOperation("user", strconv.FormatUint(ue.record.UserId, 10), ue.record.ParentDir)
+	defer unlockEntity()
+	unlockParent := lockEntityStorageParent(ue.record.ParentDir)
+	defer unlockParent()
+	if err := ue.requireRecorded(); err != nil {
+		return err
+	}
+	if err := ue.refreshRecord(); err != nil {
+		return err
+	}
+	if ue.record.Name == name {
+		path, err := ue.Path()
+		if err != nil {
+			return err
+		}
+		_, err = ensureEntityDirectory(path)
+		return err
+	}
+
+	oldName := ue.record.Name
+	// 新名归一化后（遗留尾点/空格、大小写变体）若已被其他实体的记录
+	// 占用，拒绝改名——否则两个实体记录会指向同一目录（媒体混写）。
+	// 目标目录已存在时 renameEntityDirectory 的 ErrPathConflict 也会拒绝，
+	// 此检查覆盖目标目录缺失但记录存在的窗口。
+	targetPath, targetErr := entityPath(ue.record.ParentDir, name)
+	if targetErr != nil {
+		return fmt.Errorf("rename %s: %w", ue.description(), targetErr)
+	}
+	owned, ownerErr := entityDirectoryOwnedByAnother(ue.db, ue.record.ParentDir, targetPath, "user", ue.record.UserId)
+	if ownerErr != nil {
+		return fmt.Errorf("rename %s: %w", ue.description(), ownerErr)
+	}
+	if owned {
+		return fmt.Errorf("%w: rename %s: target directory %q already belongs to another entity", ErrPathConflict, ue.description(), targetPath)
+	}
+
+	var change directoryChange
+	var err error
+	if oldName == "" {
+		change, err = recoverEmptyStoredEntityDirectory(targetPath)
+		if err != nil {
+			return fmt.Errorf("recover legacy empty-name %s directory: %w", ue.description(), err)
+		}
+	} else {
+		change, err = renameEntityDirectory(ue.record.ParentDir, oldName, name)
+	}
+	if err != nil {
+		return err
+	}
+	updated, err := database.UpdateUserEntityNameIfCurrent(ue.db, int(ue.record.Id.Int32), oldName, name)
+	if err != nil {
+		return change.rollback(fmt.Errorf("update %s database record: %w", ue.description(), err))
+	}
+	if !updated {
+		current, refreshErr := database.GetUserEntity(ue.db, int(ue.record.Id.Int32))
+		if refreshErr != nil {
+			return change.rollback(fmt.Errorf("verify %s after stale rename: %w", ue.description(), refreshErr))
+		}
+		if current == nil {
+			return change.rollback(fmt.Errorf("%w: %s no longer exists", ErrNotFound, ue.description()))
+		}
+		return change.rollback(fmt.Errorf("%w: %s no longer has name %q", ErrConcurrentUpdate, ue.description(), oldName))
+	}
+	ue.record.Name = name
 	return nil
 }
 
-func (ue *UserEntity) Rename(title string) error {
-	if !ue.created {
-		return fmt.Errorf("user entity [%s:%d] was not created", ue.record.ParentDir, ue.record.UserId)
-	}
-
-	old, _ := ue.Path()
-	newPath := filepath.Join(filepath.Dir(old), title)
-
-	err := os.Rename(old, newPath)
-	if os.IsNotExist(err) {
-		err = os.Mkdir(newPath, 0755)
-	}
-	if err != nil && !os.IsExist(err) {
-		return err
-	}
-
-	ue.record.Name = title
-	return database.UpdateUserEntity(ue.db, ue.record)
-}
-
 func (ue *UserEntity) Path() (string, error) {
-	return ue.record.Path()
+	if err := ue.requireRecord(); err != nil {
+		return "", err
+	}
+	if ue.created {
+		return storedEntityPath(ue.record.ParentDir, ue.record.Name)
+	}
+	return entityPath(ue.record.ParentDir, ue.record.Name)
 }
 
-// ParentDir 返回实体的父目录（用于在 Path 为空时生成 .loongtweet）
+// ParentDir returns the storage parent used when a profile path is not yet available.
 func (ue *UserEntity) ParentDir() string {
-	if ue.record == nil {
+	if ue == nil || ue.record == nil {
 		return ""
 	}
 	return ue.record.ParentDir
 }
 
 func (ue *UserEntity) Name() (string, error) {
-	if ue.record.Name == "" {
-		return "", fmt.Errorf("the name of user entity [%s:%d] was unset", ue.record.ParentDir, ue.record.UserId)
+	if err := ue.requireRecord(); err != nil {
+		return "", err
+	}
+	if !ue.created {
+		return "", fmt.Errorf("the name of %s is unset", ue.description())
 	}
 	return ue.record.Name, nil
 }
 
 func (ue *UserEntity) Id() (int, error) {
-	if !ue.created {
-		return 0, fmt.Errorf("user entity [%s:%d] was not created", ue.record.ParentDir, ue.record.UserId)
+	if err := ue.requireRecorded(); err != nil {
+		return 0, err
+	}
+	if !ue.record.Id.Valid || ue.record.Id.Int32 <= 0 {
+		return 0, fmt.Errorf("%s has an invalid database id", ue.description())
 	}
 	return int(ue.record.Id.Int32), nil
 }
 
 func (ue *UserEntity) LatestReleaseTime() (time.Time, error) {
-	if !ue.created {
-		return time.Time{}, fmt.Errorf("user entity [%s:%d] was not created", ue.record.ParentDir, ue.record.UserId)
+	if err := ue.requireRecorded(); err != nil {
+		return time.Time{}, err
 	}
 	return ue.record.LatestReleaseTime.Time, nil
 }
 
 func (ue *UserEntity) SetLatestReleaseTime(t time.Time) error {
-	if !ue.created {
-		return fmt.Errorf("user entity [%s:%d] was not created", ue.record.ParentDir, ue.record.UserId)
+	if err := ue.requireRecorded(); err != nil {
+		return err
 	}
+	if ue.db == nil {
+		return fmt.Errorf("set latest release time for %s: database is nil", ue.description())
+	}
+	// 与 DB 层一致（database.NormalizeTime）：存储与内存记录都归一为 UTC，
+	// 避免文本序与时刻序分叉。归一化幂等，此处对内存记录再归一一次以保持
+	// 内存值 == 存储值。
+	t = database.NormalizeTime(t)
 	err := database.SetUserEntityLatestReleaseTime(ue.db, int(ue.record.Id.Int32), t)
 	if err == nil {
-		ue.record.LatestReleaseTime.Scan(t)
+		ue.record.LatestReleaseTime.Time = t
+		ue.record.LatestReleaseTime.Valid = true
 	}
 	return err
 }
 
 func (ue *UserEntity) ClearLatestReleaseTime() error {
-	if !ue.created {
-		return fmt.Errorf("user entity [%s:%d] was not created", ue.record.ParentDir, ue.record.UserId)
+	if err := ue.requireRecorded(); err != nil {
+		return err
+	}
+	if ue.db == nil {
+		return fmt.Errorf("clear latest release time for %s: database is nil", ue.description())
 	}
 	err := database.ClearUserEntityLatestReleaseTime(ue.db, int(ue.record.Id.Int32))
 	if err == nil {
 		ue.record.LatestReleaseTime.Valid = false
+		ue.record.LatestReleaseTime.Time = time.Time{}
 	}
 	return err
 }
 
 func (ue *UserEntity) UserId() uint64 {
+	if ue == nil || ue.record == nil {
+		return 0
+	}
 	return ue.record.UserId
 }
 
 func (ue *UserEntity) Recorded() bool {
-	return ue.created
+	return ue != nil && ue.record != nil && ue.created
 }
 
 func (ue *UserEntity) MediaCount() int32 {
-	if !ue.record.MediaCount.Valid {
+	if ue == nil || ue.record == nil || !ue.record.MediaCount.Valid {
 		return 0
 	}
 	return ue.record.MediaCount.Int32
 }
 
-// MediaCountValid 返回数据库中的 media_count 是否有值（非 NULL）。
-// 当新创建的 entity 尚未同步时返回 false，调用方可据此避免使用 0 做错误推断。
+// MediaCountValid reports whether media_count is present in the database record.
 func (ue *UserEntity) MediaCountValid() bool {
-	return ue.record.MediaCount.Valid
+	return ue != nil && ue.record != nil && ue.record.MediaCount.Valid
 }
 
-// NewUserEntityFromRecord 从已有的数据库记录创建用户实体（用于恢复等场景）
+// NewUserEntityFromRecord restores a user entity from an existing database record.
 func NewUserEntityFromRecord(db *sqlx.DB, record *database.UserEntity) *UserEntity {
+	if record == nil {
+		return nil
+	}
 	return &UserEntity{
 		record:  record,
 		db:      db,
 		created: record.Id.Valid && record.Id.Int32 > 0,
 	}
+}
+
+func (ue *UserEntity) requireRecord() error {
+	if ue == nil || ue.record == nil {
+		return fmt.Errorf("user entity is nil or uninitialized")
+	}
+	return nil
+}
+
+func (ue *UserEntity) requireRecorded() error {
+	if err := ue.requireRecord(); err != nil {
+		return err
+	}
+	if !ue.created {
+		return fmt.Errorf("%s was not created", ue.description())
+	}
+	return nil
+}
+
+func (ue *UserEntity) refreshRecord() error {
+	if !ue.record.Id.Valid || ue.record.Id.Int32 <= 0 {
+		return fmt.Errorf("%s has an invalid database id", ue.description())
+	}
+	current, err := database.GetUserEntity(ue.db, int(ue.record.Id.Int32))
+	if err != nil {
+		return fmt.Errorf("refresh %s: %w", ue.description(), err)
+	}
+	if current == nil {
+		return fmt.Errorf("%w: %s no longer exists", ErrNotFound, ue.description())
+	}
+	if current.UserId != ue.record.UserId || operationParentDirKey(current.ParentDir) != operationParentDirKey(ue.record.ParentDir) {
+		return fmt.Errorf("%w: stable identity changed for %s", ErrConcurrentUpdate, ue.description())
+	}
+	*ue.record = *current
+	return nil
+}
+
+func (ue *UserEntity) description() string {
+	if ue == nil || ue.record == nil {
+		return "user entity <nil>"
+	}
+	return fmt.Sprintf("user entity [%s:%d]", ue.record.ParentDir, ue.record.UserId)
 }

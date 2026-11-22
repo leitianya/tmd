@@ -20,18 +20,22 @@ type Bot struct {
 	logHub   *consolelog.Hub
 	client   *http.Client
 
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	notifiedTasks map[string]struct{}
+	mu            sync.Mutex
+	stopCh        chan struct{}
+	wg            sync.WaitGroup
+	stopOnce      sync.Once
 }
 
 // NewBot 创建 Pushover bot 实例
 func NewBot(cfg *config.PushoverBotConfig, eb *api.EventBus, lh *consolelog.Hub) *Bot {
 	return &Bot{
-		config:   cfg,
-		eventBus: eb,
-		logHub:   lh,
-		client:   &http.Client{Timeout: 10 * time.Second},
-		stopCh:   make(chan struct{}),
+		config:        cfg,
+		eventBus:      eb,
+		logHub:        lh,
+		client:        &http.Client{Timeout: 10 * time.Second},
+		notifiedTasks: make(map[string]struct{}),
+		stopCh:        make(chan struct{}),
 	}
 }
 
@@ -42,14 +46,16 @@ func (b *Bot) Start() error {
 	if b.logHub != nil {
 		api.RunBotLogLoop(b.logHub, b.stopCh, &b.wg, b.sendLogAlert)
 	}
-	log.Infof("[bot-pushover] Started")
+	log.Infof("[bot-pushover] Started device=%q sound=%q", b.config.Device, b.config.Sound)
 	return nil
 }
 
 // Stop 停止 bot
 func (b *Bot) Stop() {
-	close(b.stopCh)
-	b.wg.Wait()
+	b.stopOnce.Do(func() {
+		close(b.stopCh)
+		b.wg.Wait()
+	})
 }
 
 // Name 返回 bot 名称
@@ -60,10 +66,35 @@ func (b *Bot) notifyTaskChanges(data interface{}) {
 	if !ok {
 		return
 	}
+	var pending []*api.Task
+	b.mu.Lock()
+	if b.notifiedTasks == nil {
+		b.notifiedTasks = make(map[string]struct{})
+	}
+	// 事件里是当前任务的全量快照，快照外的任务已过期或删除：清掉它们的
+	// 已通知标记，避免这张 map 随进程运行无限增长。
+	live := make(map[string]struct{}, len(tasks))
+	for _, task := range tasks {
+		live[task.ID] = struct{}{}
+	}
+	for id := range b.notifiedTasks {
+		if _, ok := live[id]; !ok {
+			delete(b.notifiedTasks, id)
+		}
+	}
 	for _, task := range tasks {
 		if task.Status != api.TaskStatusCompleted && task.Status != api.TaskStatusFailed {
 			continue
 		}
+		if _, ok := b.notifiedTasks[task.ID]; ok {
+			continue
+		}
+		b.notifiedTasks[task.ID] = struct{}{}
+		pending = append(pending, task)
+	}
+	b.mu.Unlock()
+
+	for _, task := range pending {
 		title := "❌ TMD Download Failed"
 		if task.Status == api.TaskStatusCompleted {
 			title = "✅ TMD Download Complete"
@@ -92,11 +123,11 @@ func (b *Bot) sendNotification(title, message string) {
 
 	resp, err := b.client.PostForm("https://api.pushover.net/1/messages.json", vals)
 	if err != nil {
-		log.Warnf("[bot-pushover] Failed to send notification: %v", err)
+		log.Warnf("[bot-pushover] Send notification failed error=%q", err.Error())
 		return
 	}
 	resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		log.Warnf("[bot-pushover] Pushover returned %d", resp.StatusCode)
+		log.Warnf("[bot-pushover] Send notification failed status=%d", resp.StatusCode)
 	}
 }

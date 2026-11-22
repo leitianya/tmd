@@ -1,11 +1,13 @@
 package api
 
 import (
+	"database/sql"
 	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/unkmonster/tmd/internal/database"
 )
 
 func TestUserDownloadTaskData(t *testing.T) {
@@ -18,11 +20,13 @@ func TestUserDownloadTaskData(t *testing.T) {
 		{
 			name: "完整数据",
 			data: UserDownloadTaskData{
-				ScreenName:    "testuser",
-				AutoFollow:    true,
-				FollowMembers: true,
-				SkipProfile:   false,
-				NoRetry:       true,
+				ScreenName: "testuser",
+				DownloadFlags: DownloadFlags{
+					AutoFollow:    true,
+					FollowMembers: true,
+					SkipProfile:   false,
+					NoRetry:       true,
+				},
 			},
 			wantJSON:   `{"screen_name":"testuser","auto_follow":true,"follow_members":true,"skip_profile":false,"no_retry":true}`,
 			wantScreen: "testuser",
@@ -56,11 +60,13 @@ func TestListDownloadTaskData(t *testing.T) {
 		{
 			name: "完整数据",
 			data: ListDownloadTaskData{
-				ListID:        12345,
-				AutoFollow:    true,
-				FollowMembers: true,
-				SkipProfile:   true,
-				NoRetry:       false,
+				ListID: 12345,
+				DownloadFlags: DownloadFlags{
+					AutoFollow:    true,
+					FollowMembers: true,
+					SkipProfile:   true,
+					NoRetry:       false,
+				},
 			},
 			wantJSON: `{"list_id":"12345","auto_follow":true,"follow_members":true,"skip_profile":true,"no_retry":false}`,
 		},
@@ -105,11 +111,13 @@ func TestStringUint64JSON(t *testing.T) {
 
 func TestFollowingDownloadTaskData(t *testing.T) {
 	data := FollowingDownloadTaskData{
-		ScreenName:    "following_user",
-		AutoFollow:    true,
-		FollowMembers: true,
-		SkipProfile:   false,
-		NoRetry:       true,
+		ScreenName: "following_user",
+		DownloadFlags: DownloadFlags{
+			AutoFollow:    true,
+			FollowMembers: true,
+			SkipProfile:   false,
+			NoRetry:       true,
+		},
 	}
 
 	bytes, err := json.Marshal(data)
@@ -181,12 +189,14 @@ func TestBatchDownloadTaskData(t *testing.T) {
 		{
 			name: "用户和列表",
 			data: BatchDownloadTaskData{
-				Users:         []string{"user1", "user2"},
-				Lists:         []StringUint64{100, 200},
-				AutoFollow:    true,
-				FollowMembers: true,
-				SkipProfile:   false,
-				NoRetry:       true,
+				Users: []string{"user1", "user2"},
+				Lists: []StringUint64{100, 200},
+				DownloadFlags: DownloadFlags{
+					AutoFollow:    true,
+					FollowMembers: true,
+					SkipProfile:   false,
+					NoRetry:       true,
+				},
 			},
 			wantJSON: `{"users":["user1","user2"],"lists":["100","200"],"following_names":null,"auto_follow":true,"follow_members":true,"skip_profile":false,"no_retry":true}`,
 		},
@@ -383,14 +393,28 @@ func TestDBEntityItem(t *testing.T) {
 		ID:                "1",
 		UserID:            "123",
 		Name:              "entity_name",
-		LatestReleaseTime: "2024-01-01 12:00:00",
+		LatestReleaseTime: "2024-01-01T12:00:00Z",
 		ParentDir:         "/data",
 		MediaCount:        50,
 	}
 
 	bytes, err := json.Marshal(item)
 	assert.NoError(t, err)
-	assert.JSONEq(t, `{"id":"1","user_id":"123","name":"entity_name","latest_release_time":"2024-01-01 12:00:00","parent_dir":"/data","media_count":50}`, string(bytes))
+	assert.JSONEq(t, `{"id":"1","user_id":"123","name":"entity_name","latest_release_time":"2024-01-01T12:00:00Z","parent_dir":"/data","media_count":50}`, string(bytes))
+}
+
+func TestDBEntityToItemUsesUTCWithExplicitOffset(t *testing.T) {
+	location := time.FixedZone("UTC+8", 8*60*60)
+	entity := &database.UserEntity{
+		LatestReleaseTime: sql.NullTime{
+			Time:  time.Date(2026, time.August, 9, 20, 30, 0, 0, location),
+			Valid: true,
+		},
+	}
+
+	item := dbEntityToItem(entity)
+
+	assert.Equal(t, "2026-08-09T12:30:00Z", item.LatestReleaseTime)
 }
 
 func TestDBListEntityItem(t *testing.T) {
@@ -437,14 +461,15 @@ func TestDBUserPreviousNameItem(t *testing.T) {
 
 func TestConfigResponse(t *testing.T) {
 	resp := ConfigResponse{
-		RootPath:           "/data",
-		MaxDownloadRoutine: 5,
-		MaxFileNameLen:     100,
+		RootPath:               "/data",
+		MaxDownloadRoutine:     5,
+		MaxUserFetchConcurrent: 3,
+		MaxFileNameLen:         100,
 	}
 
 	bytes, err := json.Marshal(resp)
 	assert.NoError(t, err)
-	assert.JSONEq(t, `{"root_path":"/data","max_download_routine":5,"max_file_name_len":100}`, string(bytes))
+	assert.JSONEq(t, `{"root_path":"/data","max_download_routine":5,"max_user_fetch_concurrent":3,"max_file_name_len":100}`, string(bytes))
 }
 
 func TestAPIResponse_JSONMarshalUnmarshal(t *testing.T) {

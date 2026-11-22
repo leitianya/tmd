@@ -55,13 +55,18 @@ logs/
 tmp/
 temp/
 downloads/
-config/
+/config/
 data/
+tools/xapi-probe/saved-api-json/
 
 # === Migration / Temp Files ===
 *.backup.*
 *.migrating
 *.replacing
+
+# === Python Cache ===
+__pycache__/
+*.py[cod]
 
 # === OS Generated Files ===
 .DS_Store
@@ -80,12 +85,14 @@ json示例/
 # === Misc ===
 todo.md
 .review/
+.audit-tmp/
 .codegraph/
 .reasonix/
 .claude/
 .gitnexus/
 
 # === Agent / Docs (not part of source) ===
+.scratch/
 CONTEXT.md
 docs/
 course/

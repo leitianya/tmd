@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sync"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,6 +24,53 @@ import (
 	"github.com/unkmonster/tmd/internal/twitter"
 	"github.com/unkmonster/tmd/internal/utils"
 )
+
+func clientAccountForLog(cli *resty.Client) string {
+	if cli == nil {
+		return "unknown"
+	}
+	name := strings.TrimSpace(twitter.GetClientScreenName(cli))
+	if name == "" {
+		return "unknown"
+	}
+	return "@" + strings.TrimPrefix(name, "@")
+}
+
+func isRetryableUserFetchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var httpErr *utils.HttpStatusError
+	if errors.As(err, &httpErr) {
+		if httpErr.Code == 429 || (httpErr.Code >= 500 && httpErr.Code < 600) {
+			return true
+		}
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "unexpected EOF")
+}
+
+func sleepContext(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
 
 func calcUserDepth(exist int, total int) int {
 	if exist >= total {
@@ -44,6 +93,7 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 		return nil, BatchDownloadSummary{}, nil
 	}
 	maxDownloadRoutine := opts.normalizedMaxDownloadRoutine()
+	log.Debugf("[batch] Preprocess start users=%d workers=%d auto_follow=%t", len(users), maxDownloadRoutine, autoFollow)
 
 	uidToUser := make(map[uint64]*twitter.User)
 	for _, u := range users {
@@ -69,7 +119,8 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 			cancel(fmt.Errorf("%v", r))
 			buf := make([]byte, 1<<16)
 			n := runtime.Stack(buf, false)
-			fmt.Printf("Recovered from panic: %v\n%s\n", r, buf[:n])
+			log.Errorf("[batch] Worker panic recovered error=%q", fmt.Sprint(r))
+			log.Debugf("[batch] Worker panic stack=%q", string(buf[:n]))
 		}
 	}
 
@@ -96,10 +147,11 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 		}
 	}
 	if len(protectedUnfollowedUsers) > 0 {
-		log.Infof("[batch] 未关注且受保护的账户 (%d，无法下载内容):", len(protectedUnfollowedUsers))
+		names := make([]string, 0, len(protectedUnfollowedUsers))
 		for _, u := range protectedUnfollowedUsers {
-			log.Infof("[batch]   - %s(@%s)", u.Name, u.ScreenName)
+			names = append(names, "@"+u.ScreenName)
 		}
+		log.Warnf("[batch] Protected users skipped count=%d users=%q", len(protectedUnfollowedUsers), strings.Join(names, ", "))
 	}
 
 	func() {
@@ -117,7 +169,7 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 			}
 			log.Infof("[batch] Downloading %d user(s): %s", len(userNames), summary)
 		}
-		log.Infoln("[batch] Start pre processing users")
+		log.Debug("[batch] Preprocessing users")
 
 		for _, userInLST := range users {
 			var pathEntity *entity.UserEntity
@@ -133,7 +185,7 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 			if !loaded {
 				pathEntity, err = syncUserAndEntity(db, user, dir, opts.normalizedMaxFileNameLen())
 				if err != nil {
-						log.Warnf("[batch] ✗ %s - failed to update user or entity: %v", user.Title(), err)
+					log.Warnf("[batch] User sync failed user=%q error=%q", user.Title(), err.Error())
 					continue
 				}
 				syncState.storeUser(user.Id, pathEntity)
@@ -141,14 +193,14 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 				upath, _ := pathEntity.Path()
 				linkds, err := database.GetUserLinks(db, user.Id)
 				if err != nil {
-					log.Warnf("[batch] ✗ %s - failed to get links to user: %v", user.Title(), err)
+					log.Warnf("[batch] User links load failed user=%q error=%q", user.Title(), err.Error())
 				}
 				for _, linkd := range linkds {
 					if err = updateUserLink(linkd, db, upath); err != nil {
 						symlinkWarnMu.Lock()
 						symlinkWarnCount++
 						if symlinkWarnCount == 1 {
-							log.Warnf("[batch] ✗ %s - symlink permission denied (suppressing further warnings)", user.Title())
+							log.Warnf("[batch] Symlink update failed user=%q error=%q", user.Title(), err.Error())
 						}
 						symlinkWarnMu.Unlock()
 					}
@@ -167,9 +219,9 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 
 				if user.IsProtected && user.Followstate == twitter.FS_UNFOLLOW && autoFollow {
 					if err := twitter.FollowUser(ctx, client, user); err != nil {
-						log.Warnf("[batch] ✗ %s - failed to follow user: %v", user.Title(), err)
+						log.Warnf("[batch] Auto-follow failed user=%q error=%q", user.Title(), err.Error())
 					} else {
-						log.Debugln("[batch] ✓", user.Title(), "-", "follow request has been sent")
+						log.Debugf("[batch] Auto-follow requested user=%q", user.Title())
 					}
 				}
 			}
@@ -184,7 +236,7 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 			upath, _ := pathEntity.Path()
 			linkname, err := pathEntity.Name()
 			if err != nil {
-				log.Warnf("[batch] ✗ %s - failed to get entity name: %v", user.Title(), err)
+				log.Warnf("[batch] Entity name failed user=%q error=%q", user.Title(), err.Error())
 				continue
 			}
 
@@ -197,7 +249,9 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 			if err == nil {
 				linkDir := filepath.Dir(linkpath)
 				if mkdirErr := os.MkdirAll(linkDir, 0755); mkdirErr == nil {
-					if err = os.Symlink(upath, linkpath); err == nil || os.IsExist(err) {
+					// ensureUserSymlink 在目标已存在时会校验并替换陈旧链接，
+					// 避免“链接指向旧目录但数据库记录假装成功”。
+					if err = ensureUserSymlink(upath, linkpath); err == nil {
 						err = database.CreateUserLink(db, curlink)
 					}
 				} else {
@@ -208,7 +262,7 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 				symlinkWarnMu.Lock()
 				symlinkWarnCount++
 				if symlinkWarnCount == 1 {
-					log.Warnf("[batch] ✗ %s - symlink permission denied (suppressing further warnings)", user.Title())
+					log.Warnf("[batch] Symlink create failed user=%q error=%q", user.Title(), err.Error())
 				}
 				symlinkWarnMu.Unlock()
 			}
@@ -216,13 +270,14 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 	}()
 
 	if userEntityHeap.Empty() {
+		log.Infof("[batch] No visible entities to download users=%d dur=%s", len(users), time.Since(start))
 		return nil, BatchDownloadSummary{}, nil
 	}
-	log.Debugln("[batch] Preprocessing finish, elapsed:", time.Since(start))
-	log.Debugln("[batch] Real members:", userEntityHeap.Size())
-	log.Debugln("[batch] Missing tweets:", missingTweets)
+	log.Debugf("[batch] Preprocess complete entities=%d missing_tweets=%d dur=%s", userEntityHeap.Size(), missingTweets, time.Since(start))
+	log.Debugf("[batch] Real members count=%d", userEntityHeap.Size())
+	log.Debugf("[batch] Missing tweets count=%d", missingTweets)
 	if symlinkWarnCount > 0 {
-		log.Warnf("[batch] Symlink permission denied: %d errors suppressed (run as admin to enable symlinks)", symlinkWarnCount)
+		log.Warnf("[batch] Symlink failures=%d hint=check_symlink_privilege_or_locked_target", symlinkWarnCount)
 	}
 
 	totalUsers := userEntityHeap.Size()
@@ -236,6 +291,10 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 	}
 	userProgress := make(map[int]*userProgressState)
 	var progressMu sync.Mutex
+
+	retryMu := sync.Mutex{}
+	retryCounts := make(map[uint64]int)
+	retryEntities := make([]*entity.UserEntity, 0)
 
 	reportProgress := func(current string) {
 		if progress == nil {
@@ -260,24 +319,26 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 
 		user := uidToUser[ent.UserId()]
 		if user == nil {
-			log.Warnf("[batch] ✗ (uid:%d) - user not found in uidToUser, skipping", ent.UserId())
+			log.Warnf("[batch] User missing uid=%d", ent.UserId())
 			markUserDone("")
 			return
 		}
 
 		entityName, nameErr := ent.Name()
 		if nameErr != nil {
-			log.Warnf("[batch] ✗ %s - failed to get entity name: %v", user.Title(), nameErr)
+			log.Warnf("[batch] Entity name failed user=%q error=%q", user.Title(), nameErr.Error())
 			markUserDone(user.ScreenName)
 			return
 		}
 
 		cli := twitter.SelectClientMFQ(ctx, client, additional, user, "/i/api/graphql/MOLbHrtk8Ovu7DUNOLcXiA/UserMedia")
+		log.Debugf("[batch] User media selected user=%q account=%s", user.Title(), clientAccountForLog(cli))
 		if ctx.Err() != nil {
 			userEntityHeap.Push(ent)
 			return
 		}
 		if cli == nil {
+			log.Debugf("[batch] No client available user=%q", user.Title())
 			userEntityHeap.Push(ent)
 			cancel(fmt.Errorf("no client available"))
 			return
@@ -285,12 +346,17 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 
 		minTime, err := ent.LatestReleaseTime()
 		if err != nil {
-			log.Warnf("[batch] ✗ %s - failed to get latest release time: %v", entityName, err)
+			log.Warnf("[batch] Latest release time failed entity=%q error=%q", entityName, err.Error())
 			markUserDone(user.ScreenName)
 			return
 		}
+		log.Debugf("[batch] User media fetch start user=%q account=%s", user.Title(), clientAccountForLog(cli))
 		tweets, err := user.GetMedias(ctx, cli, &utils.TimeRange{Min: minTime})
 		if err == twitter.ErrWouldBlock {
+			log.Debugf("[batch] User media would block user=%q account=%s", user.Title(), clientAccountForLog(cli))
+			if !sleepContext(ctx, time.Second) {
+				return
+			}
 			userEntityHeap.Push(ent)
 			return
 		}
@@ -299,10 +365,16 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 			switch apiErr.Code {
 			case twitter.ErrExceedPostLimit:
 				twitter.SetClientError(cli, fmt.Errorf("reached the limit for seeing posts today"))
+				if !sleepContext(ctx, time.Second) {
+					return
+				}
 				userEntityHeap.Push(ent)
 				return
 			case twitter.ErrAccountLocked:
 				twitter.SetClientError(cli, fmt.Errorf("account is locked"))
+				if !sleepContext(ctx, time.Second) {
+					return
+				}
 				userEntityHeap.Push(ent)
 				return
 			}
@@ -312,21 +384,44 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 			return
 		}
 		if err != nil {
-			log.Warnf("[batch] ✗ %s - failed to get user medias: %v", entityName, err)
+			log.Debugf("[batch] User media fetch error user=%q account=%s error=%q", user.Title(), clientAccountForLog(cli), err.Error())
+			retryMu.Lock()
+			attempt := retryCounts[user.Id]
+			retryCounts[user.Id] = attempt + 1
+			retryMu.Unlock()
+
+			if attempt < maxUserFetchRetries && isRetryableUserFetchError(err) && ctx.Err() == nil {
+				retryMu.Lock()
+				retryEntities = append(retryEntities, ent)
+				retryMu.Unlock()
+				log.Warnf("[batch] User media fetch retry scheduled user=%q attempt=%d max=%d error=%q", user.Title(), attempt+1, maxUserFetchRetries, err.Error())
+				return
+			}
+			if !isRetryableUserFetchError(err) {
+				log.Debugf("[batch] User media fetch non-retryable user=%q account=%s error=%q", user.Title(), clientAccountForLog(cli), err.Error())
+			}
+			log.Warnf("[batch] User media fetch failed entity=%q error=%q", entityName, err.Error())
 			markUserDone(user.ScreenName)
 			return
 		}
 
+		retryMu.Lock()
+		retryAttempts := retryCounts[user.Id]
+		retryMu.Unlock()
+		if retryAttempts > 0 {
+			log.Infof("[batch] User media fetch retry succeeded user=%q attempts=%d", user.Title(), retryAttempts)
+		}
+
 		eid, idErr := ent.Id()
 		if idErr != nil {
-			log.Warnf("[batch] ✗ %s - failed to get entity id: %v", entityName, idErr)
+			log.Warnf("[batch] Entity id failed entity=%q error=%q", entityName, idErr.Error())
 			markUserDone(user.ScreenName)
 			return
 		}
 
 		if len(tweets) == 0 {
 			if err := database.UpdateUserEntityMediCount(db, eid, user.MediaCount); err != nil {
-				log.Errorln("[batch] ✗", entityName, "-", "failed to update user medias count:", err)
+				log.Errorf("[batch] Media count update failed entity=%q error=%q", entityName, err.Error())
 			}
 			markUserDone(user.ScreenName)
 			return
@@ -346,7 +441,7 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 		}
 
 		if err := database.UpdateUserEntityTweetStat(db, eid, tweets[0].CreatedAt, user.MediaCount); err != nil {
-			log.Errorln("[batch] ✗", entityName, "-", "failed to update user tweets stat:", err)
+			log.Errorf("[batch] Tweet stat update failed entity=%q error=%q", entityName, err.Error())
 		}
 	}
 
@@ -409,37 +504,76 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 		go tweetDownloader(&config, errChan, tweetChan)
 	}
 
-	producerPool, err := ants.NewPool(min(userTweetMaxConcurrent, userEntityHeap.Size()))
+	// Producer 并发由 max_user_fetch_concurrent 控制，避免一开始就打出过多请求触发 Cloudflare 1015。
+	producerPool, err := ants.NewPool(min(opts.normalizedMaxUserFetchConcurrent(), userEntityHeap.Size()))
 	if err != nil {
 		return nil, summary, err
 	}
 	defer producerPool.Release()
 
 	go func() {
-		for !userEntityHeap.Empty() && ctx.Err() == nil {
-			selected := []int{}
-			for count := 0; count < userTweetRateLimit && ctx.Err() == nil; {
-				entity, depth, ok := popNextBatchEntity(userEntityHeap, depthByEntity, count, userTweetRateLimit, markUserDone)
-				if !ok {
-					break
+		for ctx.Err() == nil {
+			retryMu.Lock()
+			retryStartCount := len(retryEntities)
+			if retryStartCount > 0 {
+				for _, ent := range retryEntities {
+					userEntityHeap.Push(ent)
 				}
-				if entity == nil {
-					continue
-				}
-
-				prodwg.Add(1)
-				producerPool.Submit(func() {
-					producer(entity)
-				})
-				selected = append(selected, depth)
-
-				count += depth
+				retryEntities = retryEntities[:0]
 			}
-			log.Debugln("[batch] Depths:", selected)
-			prodwg.Wait()
+			retryMu.Unlock()
+			if retryStartCount > 0 {
+				log.Debugf("[batch] User media fetch retry round start users=%d", retryStartCount)
+			}
+
+			if userEntityHeap.Empty() {
+				break
+			}
+
+			for !userEntityHeap.Empty() && ctx.Err() == nil {
+				selected := []int{}
+				for count := 0; count < userTweetRateLimit && ctx.Err() == nil; {
+					entity, depth, ok := popNextBatchEntity(userEntityHeap, depthByEntity, count, userTweetRateLimit, markUserDone)
+					if !ok {
+						break
+					}
+					if entity == nil {
+						continue
+					}
+
+					prodwg.Add(1)
+					if err := producerPool.Submit(func() {
+						producer(entity)
+					}); err != nil {
+						prodwg.Done()
+						log.Errorf("[batch] Producer submit failed error=%q", err.Error())
+						cancel(err)
+						break
+					}
+					selected = append(selected, depth)
+
+					count += depth
+				}
+				log.Debugf("[batch] Selected depths count=%d values=%q", len(selected), fmt.Sprint(selected))
+				prodwg.Wait()
+			}
+			if ctx.Err() != nil {
+				break
+			}
+
+			retryMu.Lock()
+			retryCount := len(retryEntities)
+			retryMu.Unlock()
+			if retryCount == 0 {
+				break
+			}
+			log.Warnf("[batch] User media fetch retry round waiting dur=%s users=%d", userFetchRetryDelay, retryCount)
+			if !sleepContext(ctx, userFetchRetryDelay) {
+				break
+			}
 		}
 		close(tweetChan)
-		log.Debugf("[batch] Getting tweets completed, elapsed time: %v", time.Since(start))
+		log.Debugf("[batch] Tweet fetch complete dur=%s", time.Since(start))
 
 		conswg.Wait()
 		close(errChan)
@@ -449,7 +583,8 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 	for pt := range errChan {
 		fails = append(fails, pt.(*TweetInEntity))
 	}
-	log.Debugf("[batch] %d users unable to start", userEntityHeap.Size())
+	log.Debugf("[batch] Unable to start users=%d", userEntityHeap.Size())
+	log.Debugf("[batch] Complete entities=%d failed_tweets=%d unable_to_start=%d dur=%s", totalUsers, len(fails), userEntityHeap.Size(), time.Since(start))
 	return fails, summary, context.Cause(ctx)
 }
 
@@ -460,19 +595,19 @@ func popNextBatchEntity(
 	limit int,
 	markUserDone func(string),
 ) (*entity.UserEntity, int, bool) {
-	if userEntityHeap.Empty() {
+	next, ok := userEntityHeap.TryPeek()
+	if !ok {
 		return nil, 0, false
 	}
 
-	next := userEntityHeap.Peek()
 	depth := depthByEntity[next]
 	if depth > limit {
 		entityName, nameErr := next.Name()
 		if nameErr != nil {
 			entityName = fmt.Sprintf("(uid:%d)", next.UserId())
 		}
-		log.Warnf("[batch] User depth exceeds limit: %s - depth: %d", entityName, depth)
-		userEntityHeap.Pop()
+		log.Warnf("[batch] User depth exceeds limit entity=%q depth=%d", entityName, depth)
+		_, _ = userEntityHeap.TryPop()
 		markUserDone(entityName)
 		return nil, 0, true
 	}
@@ -481,5 +616,6 @@ func popNextBatchEntity(
 		return nil, 0, false
 	}
 
-	return userEntityHeap.Pop(), depth, true
+	next, ok = userEntityHeap.TryPop()
+	return next, depth, ok
 }
